@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+/trajectories/
+/webapp/skill_card/
+/docs/help_content_pages/
