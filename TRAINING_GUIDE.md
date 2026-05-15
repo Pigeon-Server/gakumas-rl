@@ -1,294 +1,149 @@
-# 训练启动说明
+# 无 LLM 冷启动训练说明
+
+本项目训练主线不依赖 LLM、OpenAI API、Ollama，也不要求人工写规则老师。推荐流程是：
+
+```text
+Masked RL 从零探索 -> 固定 seed 轨迹选优 -> masked BC 自我蒸馏 -> RL 微调 -> 循环自举
+```
 
 ## 1. 安装依赖
 
-先安装基础依赖，再按训练后端补装：
+最小冷启动训练需要环境和 SB3：
 
 ```bash
 pip install -e .
-pip install -e .[env,torch]
-pip install -e .[sb3]
+pip install -e .[env,sb3]
+```
+
+如果要使用 RLlib，可额外安装：
+
+```bash
 pip install -e .[rllib]
 ```
 
-如果你只打算跑 SB3，至少要有：
+## 2. 先做环境预检
 
 ```bash
-pip install -e .[sb3]
-pip install sb3-contrib
+python -m src.train --mode lesson --scenario first_star_regular --print-observation --dry-run
 ```
 
-## 2. 训练后端选择
+需要确认：
 
-当前可用后端：
+- `action_mask` 不是全 0
+- `reward` 是有限值
+- 环境能 `reset/step`
+- 输出里没有数值保护或非法动作告警
 
-- `sb3`：单机训练，默认已切到 `MaskablePPO`
-- `rllib`：多 worker / 可扩展训练，内部已做动作掩码
-- `torch`：仓库内的轻量调试后端
+## 3. 推荐全自动冷启动入口
 
-## 3. 先分清你要训练的是什么
-
-这个项目里常见的训练目标分三类：
-
-- `--mode exam`：只训练考试/出牌/战斗决策
-- `--mode lesson` / `--mode battle`：训练局部课程或混合局部战斗能力
-- `--mode planning`：训练**完整培育流程**，包括周行动、体力、P点、构筑、考前准备和阶段考试
-
-如果你要的是**全套培育训练**，请使用：
+默认不传 `--scenario`、也不需要传 `--mode`，让 autopilot 自己按“局部考试 -> 完整育成”的课程自动训练：
 
 ```bash
---mode planning
+python -m src.training.autopilot \
+  --iterations 3 \
+  --rl-timesteps 131072 \
+  --final-rl-timesteps 131072 \
+  --bootstrap-seed-start 1000 \
+  --bootstrap-seed-count 64
 ```
 
-不要误用 `exam`。`exam` 只适合训练局部战斗能力，不是完整养成。
-
-## 4. 直接开始训练
-
-### SB3：局部考试训练
+如果要针对完整育成阶段单独试培育奖励，可以传 `--produce-reward-config`：
 
 ```bash
-python -m gakumas_rl.train \
-  --backend sb3 \
-  --mode exam \
-  --scenario nia_master \
-  --total-timesteps 1000000 \
-  --rollout-steps 512 \
-  --learning-rate 1e-4 \
-  --checkpoint-freq 10000 \
-  --eval-freq 10000
+python -m src.training.autopilot \
+  --curriculum-start-stage 8 \
+  --produce-reward-config configs/produce_reward_nia_planning_v1.json
 ```
 
-### RLlib：局部考试训练
+它会自动完成：
+
+- 按 `初中间考试 -> 初最终考试 -> NIA中间考试 -> NIA最终考试 -> NIA选拔 -> 初全流程 -> NIA全流程` 编排课程
+- 全流程阶段会先走低难，再热启动到高难：`first_star_regular -> first_star_master`、`nia_pro -> nia_master`
+- 用 SB3 `MaskablePPO` 从零探索，并定期保存 `.zip` checkpoint
+- 让多个 checkpoint 在同一批 seed 上各打一遍，保留每个 seed 的最佳轨迹
+- 用最佳轨迹做 SB3 原生 masked BC，产出下一轮热启动 `.zip`
+- 形状兼容时，把上一阶段推荐 checkpoint 作为下一阶段热启动
+- 形状不兼容时自动跳过跨阶段热启动，例如 First Star 到 NIA 的全局观测维度不同
+- 最后一轮 BC 后自动再做一段短 RL 微调
+- 对 BC checkpoint 和最终 RL checkpoint 一起做固定 seed 横评，并在 `bootstrap_summary.json` 写出 `recommended_checkpoint`
+
+如果只想跑单个剧本，显式传 `--scenario` 或 `--no-curriculum`：
 
 ```bash
-python -m gakumas_rl.train \
-  --backend rllib \
-  --mode exam \
-  --scenario nia_master \
-  --total-timesteps 1000000 \
-  --rllib-num-workers 4 \
-  --rllib-num-envs-per-worker 1 \
-  --rllib-train-batch-size 4000 \
-  --rllib-minibatch-size 256 \
-  --rllib-num-epochs 4
+python -m src.training.autopilot --no-curriculum --mode lesson --scenario nia_master --iterations 2
 ```
 
-### SB3：完整培育流程训练（初）
+如果已经把本项目安装进当前 venv，等价短命令是 `gakumas-rl-autopilot`。遇到 `command not found` 时，说明 venv 里的 console script 没装好或指向旧项目，直接使用 `python -m src.training.autopilot` 最稳。
 
-```bash
-python -m gakumas_rl.train \
-  --backend sb3 \
-  --mode planning \
-  --scenario first_star_master \
-  --total-timesteps 10000000 \
-  --rollout-steps 512 \
-  --learning-rate 1e-4 \
-  --checkpoint-freq 50000 \
-  --eval-freq 50000 \
-  --auto-resume
+## 4. 常用控制参数
+
+- `--iterations`：自举轮数
+- `--rl-timesteps`：每轮 RL 探索步数
+- `--final-rl-timesteps`：所有 BC 蒸馏完成后追加的最终 RL 微调步数；不传时 autopilot 自动给短微调，传 `0` 时跳过
+- `--checkpoint-freq`：每隔多少步保存候选 checkpoint
+- `--eval-freq` / `--eval-episodes`：训练中评估频率
+- `--bootstrap-seed-start` / `--bootstrap-seed-count`：轨迹选优用的固定 seed 集
+- `--bc-epochs`：每轮自我蒸馏训练轮数
+- `--stochastic-eval`：轨迹选优时使用采样动作；默认使用确定性动作
+- `--selection-score-cap`：最终横评时用于抗极端 outlier 的均分截断上限，推荐模型主要看非法动作、perfect/clear 数、中位分和 reward
+- `--curriculum-start-stage`：从指定课程阶段继续跑，例如前 5 个考试阶段已完成后可传 `6`
+- `--device`：默认 `auto`，按 `cuda -> mps -> cpu` 自动选择；想强制不用 Apple MPS 时传 `--device cpu`
+- `--produce-reward-config`：完整育成使用的培育奖励 JSON；适合在 NIA/初全流程阶段做可复现的 reward 微调
+
+## 5. 产物目录
+
+默认写到：
+
+```text
+runs/autopilot_curriculum/<timestamp>/
 ```
 
-### SB3：完整培育流程训练（NIA）
+常见文件：
 
-```bash
-python -m gakumas_rl.train \
-  --backend sb3 \
-  --mode planning \
-  --scenario nia_master \
-  --total-timesteps 15000000 \
-  --rollout-steps 512 \
-  --learning-rate 1e-4 \
-  --checkpoint-freq 50000 \
-  --eval-freq 50000 \
-  --auto-resume
+- `curriculum_summary.json`：课程总摘要和最终推荐 checkpoint
+- `stage_*/bootstrap_summary.json`：单阶段完整自举摘要
+- `stage_*/preflight.json`：训练前环境预检结果
+- `stage_*/iter_*/rl/checkpoints/step_*.zip`：SB3 每轮 RL 候选模型
+- `stage_*/iter_*/selected_trajectories.jsonl`：每个 seed 选出来的最佳轨迹
+- `stage_*/iter_*/trajectory_summary.json`：轨迹选优摘要
+- `stage_*/iter_*/bc_distilled.zip`：本轮 SB3 BC 自我蒸馏产物
+- `stage_*/final_rl/`：最终 BC 后自动 RL 微调产物
+- `stage_*/final_checkpoint_evaluation.json`：最终候选 checkpoint 的固定 seed 横评
+
+## 6. 判断是否有效
+
+不要只看一次 reward。至少同时看：
+
+- 固定 seed 的 `mean_score` 是否提升
+- `selected_trajectories.jsonl` 中 `action_valid` 是否始终为 true
+- BC 输出的 `masked_acc` 是否明显高于随机
+- 回放里是否减少无意义 `end_turn`、乱用饮料或体力崩盘
+
+如果一轮没有提升，不要盲目拉长训练；先看 reward 是否太稀、轨迹池是否全是低质量局、lesson 是否过难。
+
+## 7. 课程顺序
+
+默认 autopilot 不再要求人工切换 `lesson/exam/planning`，课程顺序已经内置：
+
+```text
+first_star_regular exam(mid)
+-> first_star_regular exam(final)
+-> nia_pro exam(mid)
+-> nia_pro exam(final)
+-> nia_pro exam(selection)
+-> first_star_regular planning
+-> first_star_master planning
+-> nia_pro planning
+-> nia_master planning
 ```
 
-### 自动训练模式
+其中 `exam` 阶段只练考试局部，`planning` 阶段才包含日常课程、外出、相谈、考试/试镜等完整育成流程。完整育成信用分配更难，所以放在局部考试之后自动执行。
 
-如果你想让程序自动估算训练步数，并动态调评估/保存频率，可以加：
+## 8. LLM 删除说明
 
-```bash
---auto-train
-```
+训练主线已移除 LLM：
 
-例如：
-
-```bash
-python -m gakumas_rl.train \
-  --backend sb3 \
-  --mode exam \
-  --scenario nia_master \
-  --auto-train \
-  --auto-min-timesteps 100000 \
-  --auto-max-timesteps 5000000
-```
-
-## 5. 常用场景
-
-### NIA 完整培育
-
-```bash
-python -m gakumas_rl.train --backend sb3 --mode planning --scenario nia_master
-```
-
-### 初剧本完整培育
-
-```bash
-python -m gakumas_rl.train --backend sb3 --mode planning --scenario first_star_master
-```
-
-### 只训练考试能力
-
-```bash
-python -m gakumas_rl.train --backend sb3 --mode exam --scenario nia_master
-```
-
-### 只做 dry-run
-
-```bash
-python -m gakumas_rl.train --backend sb3 --mode exam --scenario nia_master --dry-run
-```
-
-### 查看观测/编成
-
-```bash
-python -m gakumas_rl.train --mode exam --scenario nia_master --print-observation --dry-run
-python -m gakumas_rl.train --mode exam --scenario nia_master --print-loadout
-```
-
-## 6. 100 万步够不够
-
-如果你训练的是 `exam`，100 万步可以作为一个早期检查规模，用来确认：
-
-- 环境能跑通
-- reward 没炸
-- action mask 正常
-- 策略开始学会基本合法动作和部分节奏
-
-但如果你训练的是 **完整培育流程（planning）**，100 万步通常**不够收敛**。
-
-### 对完整培育的大致预期
-
-- `first_star_master`：通常建议从 **300万 ~ 1000万+** 步开始看
-- `nia_master`：通常建议从 **800万 ~ 3000万+** 步开始看
-
-这不是硬上限，而是经验起步量级。原因是完整培育包含：
-
-- 周行动选择
-- 体力管理
-- P点管理
-- 卡组构筑
-- 饮料 / P道具使用节奏
-- 考前准备
-- 多阶段考试结果反向影响前面决策
-
-这是一个**长流程、长信用分配链**任务，比单独 `exam` 难得多。
-
-## 7. 推荐训练顺序
-
-如果你的目标是最终得到完整培育策略，不建议一开始只硬训 `planning`。
-
-更推荐：
-
-1. 先训 `exam`
-2. 再训 `lesson` / `battle`
-3. 最后训 `planning`
-
-推荐原因：
-
-- `exam` 先学会局部战斗能力
-- `lesson` / `battle` 让局部策略更稳
-- `planning` 再学习长期资源调度和全流程整合
-
-如果你有 BC 预训练权重，可以在 PPO 启动时加：
-
-```bash
---pretrained-checkpoint <BC checkpoint>
-```
-
-## 8. 推荐起步参数
-
-### 只想先把训练跑起来
-
-建议：
-
-- `--backend sb3`
-- `--scenario nia_master`
-- `--mode exam`
-- `--total-timesteps 500000`
-- `--rollout-steps 512`
-- `--learning-rate 1e-4`
-- `--checkpoint-freq 10000`
-- `--eval-freq 10000`
-
-### 要训完整培育流程
-
-建议：
-
-- `--backend sb3`
-- `--mode planning`
-- `--scenario first_star_master` 或 `nia_master`
-- `--total-timesteps` 至少从几百万级开始
-- `--rollout-steps 512`
-- `--learning-rate 1e-4`
-- `--checkpoint-freq 50000`
-- `--eval-freq 50000`
-- `--auto-resume`
-
-如果想更稳一点，可以再加：
-
-- `--auto-train`
-- `--pretrained-checkpoint <BC checkpoint>`
-
-## 9. 怎么判断是不是在收敛
-
-不要只看一次 reward 抬头。建议同时看：
-
-- evaluation reward 是否持续抬升
-- 是否更稳定地跑完整局
-- planning 模式下最终 `final_summary` 里的结局/评分是否提升
-- 非法动作、空转、资源浪费是否下降
-- checkpoint 回放里，是否能观察到更合理的体力 / P点 / 构筑节奏
-
-对于完整培育，真正有效的信号通常包括：
-
-- 更少中途崩盘
-- 更少无意义休息或空转
-- 考前牌组质量更高
-- 最终 produce result 更稳定
-
-## 10. 输出文件
-
-训练结果默认会写到 `runs/` 下，常见内容有：
-
-- `checkpoints/step_*.zip`
-- `evaluations.jsonl`
-- `artifacts.jsonl`
-- `tensorboard/`
-
-## 11. 训练时怎么判断是否在正常跑
-
-正常启动时，你应该能看到：
-
-- `SB3 backend requires ...` 之类的依赖报错没有出现
-- `Using MaskablePPO with action masking.`
-- 训练日志里会周期性打印步数、reward、评估结果
-- `runs/<name>/checkpoints/` 里持续生成 checkpoint
-
-## 12. 如果你想先验证环境
-
-先跑 dry-run：
-
-```bash
-python -m gakumas_rl.train --backend sb3 --mode exam --scenario nia_master --dry-run
-```
-
-如果这里能正常输出动作、奖励和终止信息，再开始正式训练。
-
-如果你打算训完整培育，也建议先做一次：
-
-```bash
-python -m gakumas_rl.train --backend sb3 --mode planning --scenario first_star_master --dry-run
-```
-
-确认 planning 环境本身没有问题后，再开长训。 
+- 不再提供 LLM 轨迹生成入口
+- 不再提供 LLM reward shaping
+- 基础依赖不包含 `openai`
+- 文档推荐流程改为自举训练

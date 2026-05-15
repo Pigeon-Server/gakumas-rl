@@ -1,0 +1,9 @@
+"""Produce 场景 ID 常量。"""
+
+PRODUCE_FIRST_STAR_REGULAR = 'produce-001'
+PRODUCE_FIRST_STAR_PRO = 'produce-002'
+PRODUCE_FIRST_STAR_MASTER = 'produce-003'
+PRODUCE_NIA_PRO = 'produce-004'
+PRODUCE_NIA_MASTER = 'produce-005'
+PRODUCE_FIRST_STAR_LEGEND = 'produce-006'
+

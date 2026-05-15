@@ -11,8 +11,6 @@ requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",
   "PyYAML>=6.0",
-  "Jinja2>=3.1",
-  "openai>=1.68",
 ]
 
 [project.optional-dependencies]
@@ -34,10 +32,13 @@ full = [
 ]
 
 [project.scripts]
-gakumas-rl = "gakumas_rl.train:main"
-gakumas-rl-demo = "gakumas_rl.demo_exam:main"
-gakumas-rl-inference = "gakumas_rl.inference_api:main"
+gakumas-rl = "src.training.cli:main"
+gakumas-rl-bc = "src.training.bc_pretrain:main"
+gakumas-rl-bootstrap = "src.training.self_bootstrap:main"
+gakumas-rl-autopilot = "src.training.autopilot:main"
+gakumas-rl-demo = "src.demo_exam:main"
+gakumas-rl-inference = "src.interfaces.inference_api:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["gakumas_rl*"]
+include = ["src*"]

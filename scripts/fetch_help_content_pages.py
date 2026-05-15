@@ -41,6 +41,8 @@ USER_AGENT = (
 
 @dataclass(frozen=True)
 class HelpPageEntry:
+    """官方帮助页抓取任务。"""
+
     help_category_id: str
     help_category_name: str
     item_id: str
@@ -50,6 +52,8 @@ class HelpPageEntry:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析官方帮助页抓取脚本参数。"""
+
     parser = argparse.ArgumentParser(description='Fetch help pages referenced by assets/gakumasu-diff/HelpContent.yaml.')
     parser.add_argument('--root', type=Path, default=PROJECT_ROOT)
     parser.add_argument('--output-dir', type=Path, default=Path('docs/help_content_pages'))
@@ -77,6 +81,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _load_yaml_rows(path: Path) -> list[dict[str, Any]]:
+    """读取主数据 YAML 列表。"""
+
     payload = yaml.safe_load(path.read_text(encoding='utf-8'))
     if not isinstance(payload, list):
         raise ValueError(f'Expected list in {path}')
@@ -84,6 +90,8 @@ def _load_yaml_rows(path: Path) -> list[dict[str, Any]]:
 
 
 def _load_entries(root: Path) -> list[HelpPageEntry]:
+    """从主数据库帮助页表中读取待抓取条目。"""
+
     diff_root = root / 'assets' / 'gakumasu-diff'
     categories = _load_yaml_rows(diff_root / 'HelpCategory.yaml')
     contents = _load_yaml_rows(diff_root / 'HelpContent.yaml')
@@ -108,6 +116,8 @@ def _load_entries(root: Path) -> list[HelpPageEntry]:
 
 
 def _filter_entries(entries: list[HelpPageEntry], categories: list[str], match: str, limit: int) -> list[HelpPageEntry]:
+    """按分类、关键词和数量限制筛选帮助页条目。"""
+
     category_filter = set(categories)
     match_value = match.casefold().strip()
     filtered: list[HelpPageEntry] = []
@@ -133,6 +143,8 @@ def _filter_entries(entries: list[HelpPageEntry], categories: list[str], match: 
 
 
 def _extract_title_and_text(html: str) -> tuple[str, str]:
+    """从帮助页 HTML 中提取标题和正文文本。"""
+
     title_match = re.search(r'(?is)<title[^>]*>(.*?)</title>', html)
     title = unescape(title_match.group(1)).strip() if title_match else ''
     main_match = re.search(r'(?is)<main\b[^>]*>(.*?)</main>', html)
@@ -161,21 +173,51 @@ def _extract_title_and_text(html: str) -> tuple[str, str]:
 
 
 def _safe_name(value: str) -> str:
+    """把帮助页名称转换为可用于文件名的安全文本。"""
+
     return re.sub(r'[^0-9A-Za-z._-]+', '_', value).strip('_') or 'page'
 
 
 def _write_text(path: Path, content: str) -> None:
+    """写入文本文件并自动创建父目录。"""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding='utf-8')
 
 
+def _relative_manifest_path(path: Path, output_dir: Path) -> str:
+    """返回写入 manifest 的相对文本路径，避免记录本机绝对路径。"""
+
+    try:
+        return path.relative_to(output_dir).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _resolve_manifest_text_path(output_dir: Path, text_path_value: Any) -> Path | None:
+    """解析 manifest 文本路径，兼容历史绝对路径和新的相对路径。"""
+
+    if not isinstance(text_path_value, str) or not text_path_value:
+        return None
+    text_path = Path(text_path_value)
+    if not text_path.is_absolute():
+        return output_dir / text_path
+    if text_path.exists():
+        return text_path
+    return output_dir / 'text' / text_path.name
+
+
 def _create_ssl_context() -> ssl.SSLContext:
+    """创建下载官方帮助页时使用的 SSL 上下文。"""
+
     if certifi is not None:
         return ssl.create_default_context(cafile=certifi.where())
     return ssl.create_default_context()
 
 
 def _is_retryable_fetch_error(exc: Exception) -> bool:
+    """判断下载异常是否适合重试或 fallback 到 curl。"""
+
     if isinstance(exc, urllib.error.HTTPError):
         return False
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
@@ -185,6 +227,8 @@ def _is_retryable_fetch_error(exc: Exception) -> bool:
 
 
 def _fetch_html_bytes_with_curl(url: str, headers: dict[str, str], timeout: float) -> bytes:
+    """使用 curl 下载 HTML，规避部分 Python TLS 兼容问题。"""
+
     curl_path = shutil.which('curl')
     if not curl_path:
         raise RuntimeError('curl not available')
@@ -209,6 +253,8 @@ def _fetch_one(
     timeout: float,
     refresh: bool,
 ) -> dict[str, Any]:
+    """抓取单个帮助页并返回 manifest 记录。"""
+
     file_stub = f'{entry.item_id}_{_safe_name(entry.name)}'
     text_path = text_dir / f'{file_stub}.txt'
     request_headers = {
@@ -223,7 +269,7 @@ def _fetch_one(
         'name': entry.name,
         'order': entry.order,
         'detailUrl': entry.detail_url,
-        'textPath': str(text_path),
+        'textPath': _relative_manifest_path(text_path, text_dir.parent),
         'fetchedAt': datetime.now(timezone.utc).isoformat(),
     }
     if text_path.exists() and not refresh:
@@ -247,10 +293,14 @@ def _fetch_one(
                 html = html_bytes.decode(charset, errors='replace')
                 title, text = _extract_title_and_text(html)
                 _write_text(text_path, text + '\n')
+                try:
+                    http_status = response.status
+                except AttributeError:
+                    http_status = None
                 result.update(
                     {
                         'status': 'ok',
-                        'httpStatus': getattr(response, 'status', None),
+                        'httpStatus': http_status,
                         'title': title or None,
                         'textLength': len(text),
                         'contentSha256': hashlib.sha256(html_bytes).hexdigest(),
@@ -260,7 +310,7 @@ def _fetch_one(
         except urllib.error.HTTPError as exc:
             result.update({'status': 'error', 'httpStatus': exc.code, 'error': str(exc)})
             return result
-        except Exception as exc:  # noqa: BLE001
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError) as exc:
             last_error = exc
             if _is_retryable_fetch_error(exc):
                 try:
@@ -278,8 +328,8 @@ def _fetch_one(
                         }
                     )
                     return result
-                except Exception:
-                    pass
+                except (RuntimeError, OSError, subprocess.SubprocessError) as curl_exc:
+                    last_error = curl_exc
             if attempt < 2 and _is_retryable_fetch_error(exc):
                 time.sleep(0.5 * (attempt + 1))
                 continue
@@ -291,6 +341,8 @@ def _fetch_one(
 
 
 def _write_category_markdowns(output_dir: Path, manifest: list[dict[str, Any]]) -> None:
+    """按帮助分类生成便于人工查阅的 Markdown 文件。"""
+
     category_dir = output_dir / 'categories'
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in manifest:
@@ -306,9 +358,9 @@ def _write_category_markdowns(output_dir: Path, manifest: list[dict[str, Any]]) 
             lines.append(f"- status: `{row.get('status')}`")
             if row.get('title'):
                 lines.append(f"- title: {row['title']}")
-            text_path = row.get('textPath')
-            if text_path and Path(text_path).exists():
-                text = Path(text_path).read_text(encoding='utf-8')
+            text_path = _resolve_manifest_text_path(output_dir, row.get('textPath'))
+            if text_path is not None and text_path.exists():
+                text = text_path.read_text(encoding='utf-8')
                 lines.append('')
                 lines.append('```text')
                 lines.append(text.rstrip())
@@ -318,6 +370,8 @@ def _write_category_markdowns(output_dir: Path, manifest: list[dict[str, Any]]) 
 
 
 def _write_summary_markdown(output_dir: Path, manifest: list[dict[str, Any]]) -> None:
+    """生成官方帮助页缓存摘要。"""
+
     lines = ['# Help Content Fetch Summary', '']
     lines.append(f'- generated_at: `{datetime.now(timezone.utc).isoformat()}`')
     lines.append(f'- total_pages: {len(manifest)}')
@@ -338,6 +392,8 @@ def _write_summary_markdown(output_dir: Path, manifest: list[dict[str, Any]]) ->
 
 
 def main() -> int:
+    """执行帮助页抓取、manifest 写入和分类文档生成。"""
+
     args = parse_args()
     root = args.root.resolve()
     output_dir = args.output_dir if args.output_dir.is_absolute() else root / args.output_dir

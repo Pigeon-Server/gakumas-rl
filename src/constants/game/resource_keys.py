@@ -1,0 +1,16 @@
+"""考试运行时资源 key 常量。"""
+
+RESOURCE_BLOCK = 'block'
+RESOURCE_REVIEW = 'review'
+RESOURCE_AGGRESSIVE = 'aggressive'
+RESOURCE_CONCENTRATION = 'concentration'
+RESOURCE_FULL_POWER_POINT = 'full_power_point'
+RESOURCE_PARAMETER_BUFF = 'parameter_buff'
+RESOURCE_PARAMETER_BUFF_MULTIPLE_PER_TURN = 'parameter_buff_multiple_per_turn'
+RESOURCE_LESSON_BUFF = 'lesson_buff'
+RESOURCE_ENTHUSIASTIC = 'enthusiastic'
+RESOURCE_PRESERVATION = 'preservation'
+RESOURCE_OVER_PRESERVATION = 'over_preservation'
+RESOURCE_SLEEPY = 'sleepy'
+RESOURCE_PANIC = 'panic'
+RESOURCE_STAMINA_CONSUMPTION_DOWN = 'stamina_consumption_down'

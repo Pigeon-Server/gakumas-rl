@@ -1,0 +1,6 @@
+[submodule "assets/gakumasu-diff"]
+	path = assets/gakumasu-diff
+	url = https://github.com/vertesan/gakumasu-diff.git
+[submodule "assets/GakumasTranslationData"]
+	path = assets/GakumasTranslationData
+	url = https://github.com/chinosk6/GakumasTranslationData.git

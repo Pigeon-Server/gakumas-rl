@@ -15,7 +15,7 @@
     <div class="hero-copy">
       <p class="eyebrow">Manual Exam Setup</p>
       <h1>把游戏里的真实手牌、P饮料、P物品整理成训练用 JSONL</h1>
-      <p class="hero-text">导出的每一行都是一条 exam 配置记录，可直接配合 `--manual-exam-setup` 投入 `train.py / llm_player.py / demo_exam.py`。不提供该参数时，环境仍保持原来的随机牌组。</p>
+      <p class="hero-text">导出的每一行都是一条 exam 配置记录，可直接配合 `--manual-exam-setup` 投入训练、自举或回放入口。未提供该参数时，环境仍保持原来的随机牌组。</p>
     </div>
     <div class="hero-actions">
       <button class="primary-btn" type="button" @click="saveCurrentRecord()">保存当前记录</button>
@@ -293,7 +293,7 @@
           <textarea readonly :value="previewJsonl()" rows="18"></textarea>
           <p class="import-error" x-show="importError" x-text="importError"></p>
           <div class="command-box">
-            <code>python -m gakumas_rl.train --mode exam --scenario nia_master --manual-exam-setup your_file.jsonl</code>
+            <code>python -m src.train --mode exam --scenario nia_master --manual-exam-setup your_file.jsonl</code>
           </div>
         </div>
       </div>

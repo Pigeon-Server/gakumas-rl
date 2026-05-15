@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gakumas_rl.data import MasterDataRepository
-from gakumas_rl.produce_item_interpreter import ProduceItemInterpreter, SUPPORTED_RUNTIME_PRODUCE_ITEM_PHASES, SUPPORTED_SCENARIO_TAGS
+from src.repository.master_data import MasterDataRepository
+from src.simulation.produce.items import ProduceItemInterpreter, SUPPORTED_RUNTIME_PRODUCE_ITEM_PHASES, SUPPORTED_SCENARIO_TAGS
 
 DOC_PATH = ROOT / 'docs' / 'ITEM_DRINK_CHALLENGE_COVERAGE_MATRIX.md'
 UNIMPLEMENTED_DOC_PATH = ROOT / 'docs' / 'ITEM_DRINK_CHALLENGE_UNIMPLEMENTED.md'
@@ -51,10 +51,10 @@ def _file_tokens(source_path: Path, prefix: str) -> set[str]:
     return set(re.findall(rf'{re.escape(prefix)}[A-Za-z0-9_]+', text))
 
 
-HANDLED_PRODUCE_EFFECT_TYPES = _function_tokens(ROOT / 'gakumas_rl' / 'produce_runtime.py', '_apply_produce_effect', 'ProduceEffectType_')
-if "'128'" in (ROOT / 'gakumas_rl' / 'produce_runtime.py').read_text(encoding='utf-8'):
+HANDLED_PRODUCE_EFFECT_TYPES = _function_tokens(ROOT / 'src' / 'simulation' / 'produce' / 'runtime.py', '_apply_produce_effect', 'ProduceEffectType_')
+if "'128'" in (ROOT / 'src' / 'simulation' / 'produce' / 'runtime.py').read_text(encoding='utf-8'):
     HANDLED_PRODUCE_EFFECT_TYPES.add('128')
-HANDLED_EXAM_EFFECT_TYPES = _file_tokens(ROOT / 'gakumas_rl' / 'exam_runtime.py', 'ProduceExamEffectType_')
+HANDLED_EXAM_EFFECT_TYPES = _file_tokens(ROOT / 'src' / 'simulation' / 'exam' / 'runtime.py', 'ProduceExamEffectType_')
 
 
 def _markdown_escape(value: object) -> str:

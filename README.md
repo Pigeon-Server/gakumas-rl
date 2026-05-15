@@ -2,35 +2,64 @@
 
 Gakumas 强化学习工具组
 
-```bash
-python scripts/copy_project_assets.py
-```
+主数据默认从当前包内的 `assets/` 读取；不要从外层项目隐式复制资源。
 
 ## 安装
 
 ```bash
 pip install -e .
-pip install -e .[env,torch]
+pip install -e .[env,sb3]
 ```
 
 如果还需要 API 或训练后端，再补装：
 
 ```bash
 pip install -e .[api]
-pip install -e .[sb3]
 pip install -e .[rllib]
 ```
 
 ## 运行示例
 
 ```bash
-python -m gakumas_rl.train --mode exam --scenario nia_master --dry-run
-python -m gakumas_rl.train --mode planning --scenario first_star_master --dry-run
-gakumas-rl --mode exam --scenario nia_master --print-observation --dry-run
-python -m gakumas_rl.demo_exam --checkpoint runs/sb3_exam_nia_master_xxx/checkpoints/step_500000.zip --scenario nia_master
+python -m src.train --mode exam --scenario nia_master --dry-run
+python -m src.train --mode planning --scenario first_star_master --dry-run
+python -m src.training.cli --mode exam --scenario nia_master --print-observation --dry-run
+python -m src.training.autopilot --iterations 2
+python -m src.training.self_bootstrap --mode lesson --scenario nia_master --iterations 2
 ```
 
 默认训练输出目录改为当前包下的 `runs/`。
+
+如果已用 `pip install -e .[env,sb3]` 安装到当前 venv，也可以使用 `gakumas-rl-autopilot` 等短命令；入口不存在时优先用上面的 `python -m ...` 写法。
+
+## 冷启动
+
+推荐让 autopilot 从低难到高难自动冷启动：
+
+```bash
+python -m src.training.autopilot \
+  --iterations 3 \
+  --rl-timesteps 131072 \
+  --final-rl-timesteps 131072
+```
+
+如果完整育成阶段需要单独微调培育奖励，可以额外传入培育奖励配置文件：
+
+```bash
+python -m src.training.autopilot \
+  --curriculum-start-stage 8 \
+  --produce-reward-config configs/produce_reward_nia_planning_v1.json
+```
+
+默认课程是 `初中间考试 -> 初最终考试 -> NIA中间考试 -> NIA最终考试 -> NIA选拔 -> 初Regular全流程 -> 初Master全流程 -> NIA Pro全流程 -> NIA Master全流程`。流程是：每个阶段用 SB3 MaskablePPO 从零探索或热启动探索，多个 checkpoint 在固定 seed 上选最高质量轨迹，再做 SB3 原生 masked BC 自我蒸馏，最后自动接一段短 RL 微调，并把 BC checkpoint 与微调 checkpoint 一起横评后推荐更稳的模型。
+
+训练设备默认是 `auto`，会按 `cuda -> mps -> cpu` 自动选择；Apple Silicon 上可用时会优先使用 MPS。如果完整育成阶段瓶颈在环境模拟而不是神经网络，也可以传 `--device cpu` 做对照。
+
+如果只想跑单个剧本，显式传 `--scenario` 或 `--no-curriculum`：
+
+```bash
+python -m src.training.autopilot --no-curriculum --mode lesson --scenario nia_master --iterations 2
+```
 
 ## Exam Reward Mode
 
@@ -43,16 +72,15 @@ python -m gakumas_rl.demo_exam --checkpoint runs/sb3_exam_nia_master_xxx/checkpo
 
 ## 目录说明
 
-- `gakumas_rl/`：独立后的 Python 包
-- `scripts/copy_project_assets.py`：从当前仓库复制主数据资源到独立包
+- `src/`：独立后的 Python 包
 - `assets/README.md`：资源目录说明
 - `README.source.md`：从原模块复制来的说明原文，保留作对照
 
 ## 可视化回放
 
 ```bash
-python -m gakumas_rl.demo_exam \
-  --checkpoint runs/sb3_exam_nia_master_xxx/checkpoints/step_500000.zip \
+python -m src.demo_exam \
+  --checkpoint "$(python -c 'import json; print(json.load(open("runs/self_bootstrap/bootstrap_summary.json"))["recommended_checkpoint"])')" \
   --scenario nia_master \
   --exam-reward-mode score
 ```

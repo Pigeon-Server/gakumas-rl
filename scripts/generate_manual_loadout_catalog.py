@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gakumas_rl.data import MasterDataRepository
-from gakumas_rl.service import SCENARIO_ALIASES
+from src.interfaces.service import SCENARIO_ALIASES
+from src.repository.master_data import MasterDataRepository
 
 
 def _clean_text(value: str) -> str:
@@ -189,8 +189,9 @@ def build_catalog() -> dict[str, Any]:
 
 
 def main() -> int:
-    output = ROOT / 'gakumas_rl' / 'webapp' / 'manual_loadout_catalog.js'
+    output = ROOT / 'webapp' / 'manual_loadout_catalog.js'
     catalog = build_catalog()
+    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         'window.GAKUMAS_MANUAL_LOADOUT_CATALOG = ' + json.dumps(catalog, ensure_ascii=False) + ';\n',
         encoding='utf-8',
