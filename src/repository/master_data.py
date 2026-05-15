@@ -485,6 +485,10 @@ class MasterDataRepository:
         return self.load_table('ProduceStepEventDetail')
 
     @cached_property
+    def event_suggestions(self) -> TableIndex:
+        return self.load_table('ProduceStepEventSuggestion')
+
+    @cached_property
     def produce_initial_decks(self) -> TableIndex:
         return self.load_table('ProduceInitialDeck')
 
@@ -503,6 +507,10 @@ class MasterDataRepository:
     @cached_property
     def battle_score_configs(self) -> TableIndex:
         return self.load_table('ProduceExamBattleScoreConfig')
+
+    @cached_property
+    def npc_groups(self) -> TableIndex:
+        return self.load_table('ProduceExamBattleNpcGroup')
 
     @cached_property
     def auto_evaluations(self) -> TableIndex:
@@ -551,6 +559,36 @@ class MasterDataRepository:
     @cached_property
     def battle_score_config_map(self) -> dict[str, dict[str, Any]]:
         return {row['id']: row for row in self.battle_score_configs.rows}
+
+    @cached_property
+    def battle_score_config_segments(self) -> dict[str, list[dict[str, Any]]]:
+        """按 id 分组的 ProduceExamBattleScoreConfig 分段函数。
+
+        每个 id 对应一组按 parameter 升序排列的行，
+        用于查表计算 parameter → permil 的分段映射。
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in self.battle_score_configs.rows:
+            key = str(row.get('id') or '')
+            groups.setdefault(key, []).append(row)
+        for key in groups:
+            groups[key].sort(key=lambda r: float(r.get('parameter') or 0))
+        return groups
+
+    @cached_property
+    def npc_group_map(self) -> dict[str, list[dict[str, Any]]]:
+        """按 id 分组的 ProduceExamBattleNpcGroup。
+
+        每个 id 对应一组按 number 排列的 NPC 行，
+        用于模拟 Rival 分数。
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in self.npc_groups.rows:
+            key = str(row.get('id') or '')
+            groups.setdefault(key, []).append(row)
+        for key in groups:
+            groups[key].sort(key=lambda r: int(r.get('number') or 0))
+        return groups
 
     @cached_property
     def produce_localization(self) -> dict[str, dict[str, Any]]:

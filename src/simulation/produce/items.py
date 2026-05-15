@@ -80,6 +80,9 @@ class ResolvedProduceItemEffect:
     enchant_id: str = ''
     effect_turn: int | None = None
     effect_count: int | None = None
+    skill_trigger: ResolvedProduceItemTrigger | None = None
+    """Skill 级触发器：当 ProduceItem.skills[].produceTriggerId 非空时，
+    该效果仅在对应 phase 匹配时触发，覆盖 item 级触发条件。"""
 
 
 @dataclass(frozen=True)
@@ -160,10 +163,15 @@ class ProduceItemInterpreter:
         trigger_id = str(item_row.get('produceTriggerId') or '')
         trigger = self._parse_trigger(trigger_id) if trigger_id else None
         effect_ids = []
+        skill_trigger_map: dict[str, ResolvedProduceItemTrigger | None] = {}
         for skill in item_row.get('skills', []) or []:
             effect_id = str(skill.get('produceItemEffectId') or '')
             if effect_id:
                 effect_ids.append(effect_id)
+            # 解析 skill 级触发器
+            skill_trigger_id = str(skill.get('produceTriggerId') or '')
+            if skill_trigger_id:
+                skill_trigger_map[effect_id] = self._parse_trigger(skill_trigger_id)
         if not effect_ids:
             effect_ids = [str(value) for value in item_row.get('produceItemEffectIds', []) if value]
         effects: list[ResolvedProduceItemEffect] = []
@@ -181,6 +189,7 @@ class ProduceItemInterpreter:
                     enchant_id=str(row.get('produceExamStatusEnchantId') or ''),
                     effect_turn=None if effect_turn < 0 else effect_turn,
                     effect_count=None if effect_count <= 0 else effect_count,
+                    skill_trigger=skill_trigger_map.get(effect_id),
                 )
             )
         resolved = ResolvedProduceItem(

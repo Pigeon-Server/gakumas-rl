@@ -30,6 +30,7 @@ def apply_gimmick_effect(context: ExamEffectContext, effect: dict[str, Any], sou
         context.forbidden_card_search_ids[search_id] += max(context.positive_count(context.count_value(effect)), 1)
         context.sync_forbidden_search_resources()
     elif effect_type == ExamEffect.GIMMICK_START_TURN_CARD_DRAW_DOWN:
+        # 计数型：抽牌惩罚次数，整数语义
         context.start_turn_draw_penalty += int(round(context.raw_value(effect)))
     elif effect_type == ExamEffect.GIMMICK_SLEEPY:
         context.resources['sleepy'] += context.raw_value(effect)

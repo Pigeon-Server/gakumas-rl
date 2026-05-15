@@ -13,4 +13,5 @@ def apply_item_fire_limit_add(context: ExamEffectContext, effect: dict[str, Any]
     for enchant in context.active_enchants:
         if enchant.source != 'produce_item' or enchant.remaining_count is None:
             continue
+        # 计数型：附魔触发次数，整数语义
         enchant.remaining_count += int(round(delta))

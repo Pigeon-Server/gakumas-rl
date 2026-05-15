@@ -47,8 +47,10 @@ def apply_timed_effect(context: ExamEffectContext, effect: dict[str, Any], sourc
     register_times = 1
     effect_row = dict(effect)
     if source == 'card' and effect_type == ExamEffect.PARAMETER_BUFF_MULTIPLE_PER_TURN:
+        # 计数型：注册次数，整数语义
         register_times += int(round(context.current_card_grow_total(GrowEffect.PARAMETER_BUFF_MULTIPLE_PER_TURN_ADD)))
     if source == 'card' and effect_type == ExamEffect.STAMINA_CONSUMPTION_DOWN:
+        # 计数型：持续回合数，整数语义
         effect_row['effectTurn'] = int(effect.get('effectTurn') or 0) + int(
             round(context.current_card_grow_total(GrowEffect.STAMINA_CONSUMPTION_DOWN_TURN_ADD))
         )

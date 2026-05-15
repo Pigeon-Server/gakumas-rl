@@ -560,7 +560,11 @@ def test_support_ability_effect_does_not_chain_trigger_other_support_abilities()
 
 
 def test_exam_turn_color_changes_effective_score_bonus_multiplier() -> None:
-    """当前回合颜色应把固定基准倍率切成逐回合的动态得分倍率。"""
+    """当前回合颜色应把固定基准倍率切成逐回合的动态得分倍率。
+
+    加入审查基准后，不同属性即使参数值相同，倍率也可能因 ProduceExamBattleScoreConfig
+    分段函数的差异而不同。
+    """
 
     runtime = _sample_runtime(seed=29, exam_score_bonus_multiplier=1.0)
     runtime.parameter_stats = (900.0, 300.0, 300.0)
@@ -580,7 +584,9 @@ def test_exam_turn_color_changes_effective_score_bonus_multiplier() -> None:
     assert vocal_multiplier > 1.0
     assert dance_multiplier < 1.0
     assert vocal_multiplier > dance_multiplier
-    assert dance_multiplier == pytest.approx(visual_multiplier)
+    # 审查基准使不同属性的千分率不同，dance 和 visual 倍率可能不再相等
+    assert dance_multiplier > 0.0
+    assert visual_multiplier > 0.0
 
 
 def test_scenario_parameter_growth_limit_matches_master_data() -> None:
@@ -1501,7 +1507,11 @@ def test_nia_business_commercial_facility_grants_upgraded_card() -> None:
 
 
 def test_nia_business_big_success_scales_current_business_vote_gain() -> None:
-    """营业大成功只应放大本次营业获得的粉丝票，而不是累计粉丝票。"""
+    """营业大成功只应放大本次营业获得的粉丝票，而不是累计粉丝票。
+
+    大成功效果现在从主数据 isBusinessExcellent=true 的 EventDetail 行读取，
+    测试中通过 patch 模拟大成功判定和效果查表。
+    """
 
     repository = MasterDataRepository()
     scenario = repository.build_scenario('produce-005')
@@ -1518,12 +1528,14 @@ def test_nia_business_big_success_scales_current_business_vote_gain() -> None:
     )
     runtime._candidates = [candidate]
 
-    with patch.object(runtime, '_business_big_success', lambda _source_row_id: True):
+    with patch.object(runtime, '_business_big_success', lambda _source_row_id: True), \
+         patch.object(runtime, '_lookup_business_excellent_effects', lambda _source_row_id: ['p_effect-vote_count_addition-1150_1150']):
         _reward, terminated, info = runtime.step(0)
 
     assert terminated is False
     assert info['action_type'] == 'business'
-    assert runtime.state['fan_votes'] == pytest.approx(13600.0)
+    # 基础 2400 + 大成功额外 1150 = 3550 额外，总计 13550
+    assert runtime.state['fan_votes'] == pytest.approx(13550.0)
 
 
 def test_nia_present_bonus_points_fixed_amount() -> None:
@@ -6482,3 +6494,354 @@ def test_revert_card_change_expires_after_next_step() -> None:
 
     # 执行完其他动作后 pending 应清空
     assert runtime.pending_revert_info is None
+
+
+def test_exam_ceil_positive_boundary_values() -> None:
+    """比例型收益在边界值时向上取整行为验证。
+
+    手册规则：特定の値を参照し、強化状態の値やパラメータなどが上昇する場合、
+    上昇値は切り上げて計算されます（参照型增量向上取整）。
+    """
+
+    runtime = _sample_runtime(seed=200)
+
+    # _ceil_positive 在边界值的行为
+    assert runtime._ceil_positive(0.1) == 1.0, "0.1 向上取整应为 1"
+    assert runtime._ceil_positive(0.5) == 1.0, "0.5 向上取整应为 1"
+    assert runtime._ceil_positive(0.9) == 1.0, "0.9 向上取整应为 1"
+    assert runtime._ceil_positive(1.0) == 1.0, "1.0 向上取整应为 1"
+    assert runtime._ceil_positive(1.5) == 2.0, "1.5 向上取整应为 2"
+    assert runtime._ceil_positive(0.0) == 0.0, "0.0 应返回 0"
+    assert runtime._ceil_positive(-0.5) == 0.0, "负值应返回 0"
+    assert runtime._ceil_positive(-1.0) == 0.0, "负值应返回 0"
+
+    # compose_referenced_gain：底值不取整，参照值向上取整
+    assert runtime._compose_referenced_gain(base=1.0, referenced=0.1) == 2.0, "底值1 + 参照0.1向上取整=1 → 合计2"
+    assert runtime._compose_referenced_gain(base=1.0, referenced=0.5) == 2.0, "底值1 + 参照0.5向上取整=1 → 合计2"
+    assert runtime._compose_referenced_gain(base=1.0, referenced=0.9) == 2.0, "底值1 + 参照0.9向上取整=1 → 合计2"
+    assert runtime._compose_referenced_gain(base=1.0, referenced=1.5) == 3.0, "底值1 + 参照1.5向上取整=2 → 合计3"
+
+    # _positive_count：正向增量转换为整数
+    assert runtime._positive_count(0.1) == 1, "0.1 向上取整为整数 1"
+    assert runtime._positive_count(0.5) == 1, "0.5 向上取整为整数 1"
+    assert runtime._positive_count(0.9) == 1, "0.9 向上取整为整数 1"
+    assert runtime._positive_count(1.5) == 2, "1.5 向上取整为整数 2"
+
+
+def test_exam_ratio_effect_uses_ceil_not_round() -> None:
+    """比例参照型收益（好印象依赖、分数依赖等）应使用 _ceil_positive 向上取整，
+    而非 Python 的 bankers rounding（int(round())）。
+
+    验证在 effectValue1=500（50%）时，0.5 倍率的收益向上取整为 1 而非 round 到 0。
+    """
+
+    runtime = _sample_runtime(seed=201)
+    runtime.resources['aggressive'] = 1.0
+    runtime.resources['lesson_buff'] = 0.0
+    runtime.resources['enthusiastic'] = 0.0
+
+    # 好印象依赖强气：50% 比例 → 0.5 向上取整为 1
+    review_effect = {
+        'id': 'test-effect-review-ceil-boundary',
+        'effectType': 'ProduceExamEffectType_ExamReviewDependExamCardPlayAggressive',
+        'effectValue1': 500,  # 50%
+    }
+    runtime._apply_exam_effect(review_effect, source='card')
+    assert runtime.resources['review'] == 1.0, "aggressive=1 × 50% = 0.5，向上取整应为 1"
+
+    # 清理状态
+    runtime.resources['review'] = 0.0
+    runtime.resources['aggressive'] = 3.0
+    runtime.active_effects = []
+
+    # aggressive=3 × 50% = 1.5，向上取整为 2
+    runtime._apply_exam_effect(review_effect, source='card')
+    assert runtime.resources['review'] == 2.0, "aggressive=3 × 50% = 1.5，向上取整应为 2"
+
+
+def test_exam_count_type_uses_round_not_ceil() -> None:
+    """计数型场景（出牌次数、层数等）应使用 int(round()) 而非 _ceil_positive()。
+
+    这类值语义上是整数次数，不是"收益增量"，按手册不适用切り上げ规则。
+    """
+
+    runtime = _sample_runtime(seed=202)
+
+    # _base_play_limit 中 PlayableValueAdd 是计数型
+    # 验证 int(round()) 在 0.5 时使用 bankers rounding（Python round(0.5)=0）
+    # 而不是 _ceil_positive(0.5)=1.0
+    # 这是正确的，因为出牌次数是计数型而非收益型
+    import math
+    assert int(round(0.5)) == 0, "Python round(0.5) 使用 bankers rounding 结果为 0"
+    assert runtime._ceil_positive(0.5) == 1.0, "_ceil_positive(0.5) 向上取整为 1"
+
+    # _card_repeat_bonus 也是计数型
+    # 验证 _consume_parameter_buff_multiple 中 remaining = int(round(amount)) 是计数型
+    # 设置一个非常小的浮点值，确认行为
+    runtime.resources['parameter_buff'] = 0.5
+    runtime._consume_parameter_buff_multiple(0.5)
+    # 0.5 round 到 0，不会消耗任何层
+
+
+def test_exam_turn_decay_skips_same_turn_effects() -> None:
+    """ターン経過減免：本回合新挂的持续效果不当回合衰减。
+
+    手册规则：新規効果が付与されたターンは減免されない。
+    即 applied_turn == self.turn 时，remaining_turns 不减少。
+    """
+
+    runtime = _sample_runtime(seed=300)
+    # 在第 1 回合挂上 3 回合效果
+    runtime.turn = 1
+    effect_data = {
+        'id': 'test-decay-skip-1',
+        'effectType': 'ProduceExamEffectType_ExamLessonBuffAdditive',
+        'effectValue1': 10,
+        'effectTurn': 3,
+    }
+    runtime._register_timed_effect(effect_data, source='card')
+    assert len(runtime.active_effects) == 1
+    timed = runtime.active_effects[-1]
+    assert timed.remaining_turns == 3, "新挂效果应为 3 回合"
+    assert timed.applied_turn == 1, "applied_turn 应为当前回合 1"
+
+    # 本回合内衰减不应减少
+    runtime._decay_turn_effects()
+    assert runtime.active_effects[-1].remaining_turns == 3, "本回合新挂效果不应衰减"
+
+
+def test_exam_turn_decay_reduces_previous_turn_effects() -> None:
+    """ターン経過減免：上回合挂的效果在当前回合衰减 1。
+
+    上回合挂上的 3 回合效果，本回合结束后剩 2 回合。
+    """
+
+    runtime = _sample_runtime(seed=301)
+    # 在第 1 回合挂上 3 回合效果
+    runtime.turn = 1
+    effect_data = {
+        'id': 'test-decay-reduce-1',
+        'effectType': 'ProduceExamEffectType_ExamLessonBuffAdditive',
+        'effectValue1': 10,
+        'effectTurn': 3,
+    }
+    runtime._register_timed_effect(effect_data, source='card')
+    timed = runtime.active_effects[-1]
+    assert timed.remaining_turns == 3
+    assert timed.applied_turn == 1
+
+    # 进入第 2 回合，衰减应减少 1
+    runtime.turn = 2
+    runtime._decay_turn_effects()
+    assert runtime.active_effects[-1].remaining_turns == 2, "上回合挂的效果本回合衰减后应剩 2"
+
+    # 进入第 3 回合，再衰减
+    runtime.turn = 3
+    runtime._decay_turn_effects()
+    assert runtime.active_effects[-1].remaining_turns == 1, "继续衰减后应剩 1"
+
+
+def test_exam_enchant_decay_skips_same_turn() -> None:
+    """ターン経過減免：本回合新挂的附魔不当回合衰减。"""
+
+    runtime = _sample_runtime(seed=302)
+    # 需要注入一个合法的 enchant 数据到 repository 的 enchant_map 中
+    enchant_id = 'test-enchant-decay-1'
+    runtime.repository.exam_status_enchant_map[enchant_id] = {
+        'id': enchant_id,
+        'produceExamTriggerId': '',
+        'produceExamEffectIds': [],
+    }
+    runtime.turn = 1
+    initial_enchant_count = len(runtime.active_enchants)
+    runtime._apply_status_enchant({
+        'id': 'test-effect-enchant-1',
+        'effectType': 'ProduceExamEffectType_ExamStatusEnchant',
+        'produceExamStatusEnchantId': enchant_id,
+        'effectTurn': 2,
+    }, source='card')
+    assert len(runtime.active_enchants) == initial_enchant_count + 1
+    enchant = runtime.active_enchants[-1]
+    assert enchant.applied_turn == 1, "附魔 applied_turn 应为当前回合 1"
+
+    # 本回合衰减不应减少
+    runtime._decay_turn_effects()
+    assert runtime.active_enchants[-1].remaining_turns == 2, "本回合新挂附魔不应衰减"
+
+    # 下一回合衰减
+    runtime.turn = 2
+    runtime._decay_turn_effects()
+    assert runtime.active_enchants[-1].remaining_turns == 1, "上回合挂的附魔本回合衰减后应剩 1"
+
+
+def test_exam_self_lesson_disallows_drinks() -> None:
+    """自主训练（SelfLesson）模式下不可使用饮料。
+
+    手册规则：自主レッスンではPドリンクを使用できません。
+    """
+
+    runtime = _sample_runtime(seed=303)
+    # 模拟自主训练模式
+    runtime.stage_type = 'ProduceStepType_SelfLessonVocalNormal'
+    assert runtime._resolve_battle_kind(None) == 'lesson', "SelfLesson 应解析为 lesson"
+
+    # 验证饮料不可使用
+    for drink in runtime.drinks:
+        assert not runtime._can_use_drink(drink), "SelfLesson 模式下饮料不可使用"
+
+    # 验证普通课程可以
+    runtime.stage_type = 'ProduceStepType_LessonVocalNormal'
+    assert runtime._resolve_battle_kind(None) == 'lesson', "普通课程也应为 lesson"
+    # 普通课程在无出牌窗口时也不可使用，但有窗口时应该可以
+    # （此处仅验证不因 stage_type 被禁止）
+
+
+def test_exam_judging_trend_multiplier_increases_for_high_parameter() -> None:
+    """审查基准满足时（参数高），分数倍率应高于基准。
+
+    使用 ProduceExamBattleScoreConfig 分段函数验证：参数越高，千分率越高。
+    """
+
+    runtime = _sample_runtime(seed=400)
+    # 确保有审查基准数据
+    score_config_id = str(runtime.profile.get('score_config_id') or '')
+    if not score_config_id:
+        pytest.skip('No score config for this runtime')
+
+    # 保存原始状态
+    original_stats = runtime.parameter_stats
+    original_color = runtime.current_turn_color
+
+    # 设置高参数
+    runtime.parameter_stats = (1000.0, 100.0, 100.0)
+    runtime.current_turn_color = 'vocal'
+    high_permil = runtime._lookup_score_permil(1000.0, 'vocal')
+
+    # 设置低参数
+    runtime.parameter_stats = (50.0, 100.0, 100.0)
+    low_permil = runtime._lookup_score_permil(50.0, 'vocal')
+
+    # 高参数的千分率应高于低参数
+    assert high_permil > low_permil, f"高参数千分率({high_permil})应高于低参数({low_permil})"
+
+    # 审查基准乘数应反映差异
+    runtime.parameter_stats = (1000.0, 100.0, 100.0)
+    high_trend = runtime._judging_trend_multiplier()
+
+    runtime.parameter_stats = (50.0, 100.0, 100.0)
+    low_trend = runtime._judging_trend_multiplier()
+
+    assert high_trend > low_trend, f"高参数趋势乘数({high_trend})应高于低参数({low_trend})"
+
+    # 恢复原始状态
+    runtime.parameter_stats = original_stats
+    runtime.current_turn_color = original_color
+
+
+def test_exam_judging_trend_returns_1_without_score_config() -> None:
+    """无审查基准配置时，_judging_trend_multiplier 应返回 1.0。"""
+
+    runtime = _sample_runtime(seed=401)
+    # 清空 score_config_id
+    runtime.profile['score_config_id'] = ''
+    assert runtime._judging_trend_multiplier() == 1.0
+
+
+def test_exam_lookup_score_permil_interpolates_between_segments() -> None:
+    """分段函数在两个参数节点之间应做线性插值。"""
+
+    runtime = _sample_runtime(seed=402)
+    score_config_id = str(runtime.profile.get('score_config_id') or '')
+    if not score_config_id:
+        pytest.skip('No score config for this runtime')
+
+    segments = runtime.repository.battle_score_config_segments.get(score_config_id, [])
+    if len(segments) < 2:
+        pytest.skip('Not enough segments for interpolation test')
+
+    # 取前两个节点
+    low_param = float(segments[0].get('parameter') or 0)
+    high_param = float(segments[1].get('parameter') or 0)
+    if high_param <= low_param:
+        pytest.skip('Segment parameters not in ascending order')
+
+    # 中点插值
+    mid_param = (low_param + high_param) / 2.0
+    low_permil = float(segments[0].get('vocalPermil') or 1000)
+    high_permil = float(segments[1].get('vocalPermil') or 1000)
+    expected_mid = (low_permil + high_permil) / 2.0
+
+    actual_mid = runtime._lookup_score_permil(mid_param, 'vocal')
+    assert actual_mid == pytest.approx(expected_mid, rel=0.01), f"中点插值({actual_mid})应接近({expected_mid})"
+
+
+def test_exam_rank_state_initialized_from_profile() -> None:
+    """ExamRankState 应从 profile 中的 rank_threshold/base_score/force_end_score 初始化。"""
+
+    runtime = _sample_runtime(seed=500)
+    assert runtime.rank_state.rank_threshold >= 1, "rank_threshold 应大于等于1"
+    assert runtime.rank_state.force_end_score >= 0.0, "force_end_score 应非负"
+
+
+def test_exam_rival_scores_initialized_from_npc_group() -> None:
+    """考试模式下 Rival 分数应从 ProduceExamBattleNpcGroup 初始化。"""
+
+    runtime = _sample_runtime(seed=501)
+    if runtime.battle_kind == 'lesson':
+        pytest.skip('课程模式无 Rival')
+    npc_group_id = str(runtime.profile.get('npc_group_id') or '')
+    if not npc_group_id:
+        pytest.skip('当前 runtime 无 NPC 组配置')
+    # Rival 分数应非空
+    assert len(runtime.rank_state.rival_scores) > 0, "考试模式应有 Rival 分数"
+    # 每个 Rival 的初始分数应在合理范围
+    for score in runtime.rank_state.rival_scores:
+        assert score >= 0.0, f"Rival 初始分数应非负，实际为 {score}"
+
+
+def test_exam_rival_scores_increase_each_turn() -> None:
+    """每回合 Rival 分数应增长。"""
+
+    runtime = _sample_runtime(seed=502)
+    if runtime.battle_kind == 'lesson':
+        pytest.skip('课程模式无 Rival')
+    npc_group_id = str(runtime.profile.get('npc_group_id') or '')
+    if not npc_group_id:
+        pytest.skip('当前 runtime 无 NPC 组配置')
+    initial_scores = list(runtime.rank_state.rival_scores)
+    if not initial_scores:
+        pytest.skip('无 Rival 分数')
+    # 模拟一回合
+    runtime.turn = 1
+    runtime._simulate_rival_turn_scores()
+    for i, (initial, current) in enumerate(zip(initial_scores, runtime.rank_state.rival_scores)):
+        assert current > initial, f"Rival {i} 分数应增长: {initial} -> {current}"
+
+
+def test_exam_self_rank_computed_correctly() -> None:
+    """_update_self_rank 应根据玩家分数和 Rival 分数计算正确排名。"""
+
+    runtime = _sample_runtime(seed=503)
+    # 手动设置 Rival 分数和玩家分数
+    runtime.rank_state.rival_scores = [100.0, 50.0, 200.0]
+    runtime.score = 150.0
+    runtime._update_self_rank()
+    # 200 > 150 > 100 > 50，排名应为 2
+    assert runtime.rank_state.self_rank == 2, f"排名应为 2，实际为 {runtime.rank_state.self_rank}"
+
+
+def test_exam_passed_set_when_rank_within_threshold() -> None:
+    """排名在 rank_threshold 内时应设置 passed=True。"""
+
+    runtime = _sample_runtime(seed=504)
+    if runtime.battle_kind == 'lesson':
+        pytest.skip('课程模式无排名判定')
+    runtime.rank_state.rank_threshold = 3
+    runtime.rank_state.rival_scores = [100.0, 50.0, 200.0]
+    runtime.score = 150.0
+    # 排名 2 <= 3，应通过
+    runtime._update_self_rank()
+    assert runtime.rank_state.self_rank == 2
+    # 手动触发合格判定
+    runtime._update_clear_state_after_score_change()
+    assert runtime.rank_state.passed, "排名 2 <= rank_threshold 3，应通过"

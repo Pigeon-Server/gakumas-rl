@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections import Counter, defaultdict, deque
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
+import logging
 import math
 from typing import Any, Iterable
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from ...constants.game.support_types import (
     SUPPORT_TYPE_ASSIST,
@@ -177,6 +180,8 @@ class TimedExamEffect:
     remaining_turns: int | None
     remaining_count: int | None
     source: str
+    applied_turn: int = 0
+    """效果被挂上的回合号，用于ターン経過減免：本回合新挂的效果不当回合衰减。"""
 
 
 @dataclass
@@ -190,6 +195,8 @@ class TriggeredEnchant:
     remaining_turns: int | None
     remaining_count: int | None
     source: str
+    applied_turn: int = 0
+    """附魔被挂上的回合号，用于ターン経過減免：本回合新挂的附魔不当回合衰减。"""
     source_identity: str = ''
 
 
@@ -209,6 +216,36 @@ class ExamEvent:
     turn: int
     event_type: str
     detail: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ExamRankState:
+    """考试排名与合格状态。
+
+    从 ProduceStepAuditionDifficulty.rankThreshold、baseScore、forceEndScore 初始化。
+    每回合通过 Rival 分数模拟更新 self_rank，最终判定合格/不合格。
+    """
+
+    self_rank: int = 0
+    """玩家当前排名（1=最高分）。"""
+
+    rival_scores: list[float] = field(default_factory=list)
+    """各 Rival 当前累计分数。"""
+
+    pass_condition: str = 'rank_threshold'
+    """合格判定条件：'rank_threshold'（排名达标）/ 'score_threshold'（分数达标）/ 'force_end'（强制结束）。"""
+
+    rank_threshold: int = 3
+    """排名合格线：排名 <= rank_threshold 即合格。从 ProduceStepAuditionDifficulty.rankThreshold 读取。"""
+
+    score_threshold: float = 0.0
+    """分数达标阈值。从 ProduceStepAuditionDifficulty.baseScore 读取。"""
+
+    force_end_score: float = 0.0
+    """强制结束分数（0 表示无限制）。从 ProduceStepAuditionDifficulty.forceEndScore 读取。"""
+
+    passed: bool = False
+    """是否已通过合格判定。"""
 
 
 @dataclass
@@ -265,6 +302,7 @@ class ExamRuntimePreviewState:
     forbidden_card_search_ids: Counter[str]
     lesson_cleared: bool
     clear_state: str
+    rank_state: ExamRankState
     event_log: list[ExamEvent]
     milestone_flags: dict[str, bool]
     consecutive_end_turns: int
@@ -345,7 +383,10 @@ class ExamRuntime:
         self.reward_config: RewardConfig = reward_config or build_reward_config(reward_mode)
         self.stage_type = stage_type or scenario.default_stage
         self.np_random = np.random.default_rng(seed)
-        self.exam_setting = repository.load_table('ExamSetting').first('p_exam_setting-1') or {}
+        # 从 Produce 表的 examSettingId 字段读取 ExamSetting 行 ID，fallback 到默认值
+        produce_row = repository.produces.first(scenario.produce_id) or {}
+        exam_setting_id = str(produce_row.get('examSettingId') or 'p_exam_setting-1')
+        self.exam_setting = repository.load_table('ExamSetting').first(exam_setting_id) or {}
         self.card_searches = repository.load_table('ProduceCardSearch')
         self.grow_effects = repository.load_table('ProduceCardGrowEffect')
         self.card_status_enchants = repository.load_table('ProduceCardStatusEnchant')
@@ -524,6 +565,12 @@ class ExamRuntime:
         self.forbidden_card_search_ids: Counter[str] = Counter()
         self.lesson_cleared = False
         self.clear_state = 'ongoing'
+        self.rank_state = ExamRankState(
+            rank_threshold=int(self.profile.get('rank_threshold') or 3),
+            score_threshold=float(self.profile.get('base_score') or 0.0),
+            force_end_score=float(self.profile.get('force_end_score') or 0.0),
+        )
+        self._init_rival_scores()
         self.event_log: list[ExamEvent] = []
 
         # ── 奖励追踪状态 ──
@@ -591,6 +638,15 @@ class ExamRuntime:
             forbidden_card_search_ids=Counter(self.forbidden_card_search_ids),
             lesson_cleared=bool(self.lesson_cleared),
             clear_state=str(self.clear_state),
+            rank_state=ExamRankState(
+                self_rank=int(self.rank_state.self_rank),
+                rival_scores=list(self.rank_state.rival_scores),
+                pass_condition=str(self.rank_state.pass_condition),
+                rank_threshold=int(self.rank_state.rank_threshold),
+                score_threshold=float(self.rank_state.score_threshold),
+                force_end_score=float(self.rank_state.force_end_score),
+                passed=bool(self.rank_state.passed),
+            ),
             event_log=[ExamEvent(turn=event.turn, event_type=event.event_type, detail=dict(event.detail)) for event in self.event_log],
             milestone_flags=dict(self._milestone_flags),
             consecutive_end_turns=int(self._consecutive_end_turns),
@@ -644,6 +700,15 @@ class ExamRuntime:
         self.forbidden_card_search_ids = Counter(state.forbidden_card_search_ids)
         self.lesson_cleared = bool(state.lesson_cleared)
         self.clear_state = str(state.clear_state)
+        self.rank_state = ExamRankState(
+            self_rank=int(state.rank_state.self_rank),
+            rival_scores=list(state.rank_state.rival_scores),
+            pass_condition=str(state.rank_state.pass_condition),
+            rank_threshold=int(state.rank_state.rank_threshold),
+            score_threshold=float(state.rank_state.score_threshold),
+            force_end_score=float(state.rank_state.force_end_score),
+            passed=bool(state.rank_state.passed),
+        )
         self.event_log = [ExamEvent(turn=event.turn, event_type=event.event_type, detail=dict(event.detail)) for event in state.event_log]
         self._milestone_flags = dict(state.milestone_flags)
         self._consecutive_end_turns = int(state.consecutive_end_turns)
@@ -752,7 +817,7 @@ class ExamRuntime:
             profile['turns'] = float(self._initial_turn_limit)
         return profile
 
-    def _build_battle_profile(self, stage_row: dict[str, Any] | None) -> dict[str, float]:
+    def _build_battle_profile(self, stage_row: dict[str, Any] | None) -> dict[str, Any]:
         """从显式关卡行或主数据库 profile 构造 battle profile。"""
 
         if stage_row is not None:
@@ -779,6 +844,16 @@ class ExamRuntime:
                 'vocal_weight': float(weight_vector[0]),
                 'dance_weight': float(weight_vector[1]),
                 'visual_weight': float(weight_vector[2]),
+                # 审查基准相关字段
+                'score_config_id': str(config.get('produceExamBattleScoreConfigId') or ''),
+                'vocal_excellent': float(config.get('vocalExcellent') or 0),
+                'dance_excellent': float(config.get('danceExcellent') or 0),
+                'visual_excellent': float(config.get('visualExcellent') or 0),
+                'vocal_bad': float(config.get('vocalBad') or 0),
+                'dance_bad': float(config.get('danceBad') or 0),
+                'visual_bad': float(config.get('visualBad') or 0),
+                # NPC 组相关字段
+                'npc_group_id': str(stage_row.get('produceExamBattleNpcGroupId') or ''),
             }
         if self.battle_kind == 'lesson':
             return self._build_lesson_battle_profile_from_master()
@@ -816,14 +891,26 @@ class ExamRuntime:
         return max(float(self.profile.get('base_score') or 0.0), 0.0)
 
     def _current_perfect_target(self) -> float:
-        """返回当前训练课 perfect 目标值。"""
+        """返回当前训练课 perfect 目标值。
+
+        优先使用主数据 ProduceStepLessonLevel.resultTargetValueLimit 传入的值。
+        仅在主数据未提供且 reward_mode=clear 时，使用 2x clear_target 作为
+        兜底估算（非手册规定，仅用于缺少主数据时的回退）。
+        """
 
         if not self._uses_clear_training_rules():
             return 0.0
+        # 优先使用主数据 resultTargetValueLimit
         if self.lesson_perfect_value is not None:
             return max(float(self.lesson_perfect_value), 0.0)
+        # 兜底：主数据缺失时用 2x clear_target 近似，但应通过 resolve_lesson_training_spec 传入
         clear_target = self._current_clear_target()
-        if self.reward_mode == 'clear' and clear_target > 0:
+        if clear_target > 0:
+            logger.warning(
+                'Perfect 目标值未从主数据传入，使用 2x clear_target=%0.1f 近似。'
+                '请通过 lesson_perfect_value 参数传入 ProduceStepLessonLevel.resultTargetValueLimit',
+                clear_target * 2.0,
+            )
             return clear_target * 2.0
         return 0.0
 
@@ -915,11 +1002,20 @@ class ExamRuntime:
                 self._cap_score_to_force_end(force_end_score)
                 if self.clear_state != 'force_end':
                     self.clear_state = 'force_end'
+                    self.rank_state.passed = True
                     self._record_event('force_end_reached', {
                         'score': self.score,
                         'force_end_score': force_end_score,
                     })
                 self.terminated = True
+            # 更新排名合格判定
+            self._update_self_rank()
+            if not self.rank_state.passed and self.rank_state.self_rank <= self.rank_state.rank_threshold:
+                self.rank_state.passed = True
+                self._record_event('rank_passed', {
+                    'self_rank': self.rank_state.self_rank,
+                    'rank_threshold': self.rank_state.rank_threshold,
+                })
             return
 
         if not self._uses_clear_training_rules():
@@ -1012,6 +1108,12 @@ class ExamRuntime:
         self.forbidden_card_search_ids = Counter()
         self.lesson_cleared = False
         self.clear_state = 'ongoing'
+        self.rank_state = ExamRankState(
+            rank_threshold=int(self.profile.get('rank_threshold') or 3),
+            score_threshold=float(self.profile.get('base_score') or 0.0),
+            force_end_score=float(self.profile.get('force_end_score') or 0.0),
+        )
+        self._init_rival_scores()
         self._milestone_flags = {'25': False, '50': False, '75': False, '100': False}
         self._consecutive_end_turns = 0
         self._prev_score = 0.0
@@ -1159,6 +1261,9 @@ class ExamRuntime:
             'fan_vote_baseline': self._reported_fan_vote_baseline(),
             'fan_vote_requirement': self._reported_fan_vote_requirement(),
             'clear_state': self.clear_state,
+            'rank': self.rank_state.self_rank,
+            'passed': self.rank_state.passed,
+            'rival_scores': list(self.rank_state.rival_scores),
             'deck': len(self.deck),
             'hand': len(self.hand),
             'grave': len(self.grave),
@@ -1636,7 +1741,162 @@ class ExamRuntime:
                 })
         return cards
 
+    def _lookup_score_permil(self, parameter_value: float, stat_key: str) -> float:
+        """从 ProduceExamBattleScoreConfig 分段函数中查表返回参数对应的千分率。
+
+        Args:
+            parameter_value: 当前参数值
+            stat_key: 属性键名，如 'vocal'/'dance'/'visual'
+
+        Returns:
+            对应的千分率值；无分段数据时返回 1000.0（即 1.0 倍基准）
+        """
+        score_config_id = str(self.profile.get('score_config_id') or '')
+        if not score_config_id:
+            return 1000.0
+        segments = self.repository.battle_score_config_segments.get(score_config_id)
+        if not segments:
+            return 1000.0
+        permil_key = f'{stat_key}Permil'
+        # 线性插值查找：在 parameter 分段之间做插值
+        if parameter_value <= float(segments[0].get('parameter') or 0):
+            return float(segments[0].get(permil_key) or 1000.0)
+        for i in range(len(segments) - 1):
+            low_param = float(segments[i].get('parameter') or 0)
+            high_param = float(segments[i + 1].get('parameter') or 0)
+            if parameter_value <= high_param:
+                low_permil = float(segments[i].get(permil_key) or 1000.0)
+                high_permil = float(segments[i + 1].get(permil_key) or 1000.0)
+                if high_param <= low_param:
+                    return high_permil
+                ratio = (parameter_value - low_param) / (high_param - low_param)
+                return low_permil + (high_permil - low_permil) * ratio
+        return float(segments[-1].get(permil_key) or 1000.0)
+
+    def _judging_trend_multiplier(self) -> float:
+        """根据当前回合颜色和审查基准分段函数计算审查基准加成。
+
+        手册规则：审查基准を満たしているとスコアボーナスが上昇しやすくなり、
+        満たしていないと上昇しにくくなる。
+        使用 ProduceExamBattleScoreConfig 的分段函数计算实际千分率与基准(1000)的比值。
+        """
+        if not self._turn_color_enabled():
+            return 1.0
+        color_index = TURN_COLOR_INDEX.get(self.current_turn_color)
+        if color_index is None:
+            return 1.0
+        stat_keys = ['vocal', 'dance', 'visual']
+        stat_key = stat_keys[color_index]
+        selected_stat = float(np.array(self.parameter_stats, dtype=np.float32)[color_index])
+        # 从分段函数查当前参数对应的千分率
+        actual_permil = self._lookup_score_permil(selected_stat, stat_key)
+        # 基准千分率为 1000（1.0倍），实际比值即为审查基准加成
+        return max(actual_permil / 1000.0, 0.0)
+
     def _default_score_bonus_multiplier(self) -> float:
+        """根据偶像属性与亲爱度估算默认分数倍率。"""
+
+        if self.loadout is None:
+            return 1.0
+        weights = np.array(
+            [
+                float(self.profile.get('vocal_weight') or self.scenario.score_weights[0]),
+                float(self.profile.get('dance_weight') or self.scenario.score_weights[1]),
+                float(self.profile.get('visual_weight') or self.scenario.score_weights[2]),
+            ],
+            dtype=np.float32,
+        )
+        stats = np.array(self.parameter_stats, dtype=np.float32)
+        weighted_parameter = float(np.dot(stats, weights))
+        baseline = float(self.profile.get('parameter_baseline') or 0.0)
+        if baseline <= 0.0:
+            audition_difficulty_id = str(self.loadout.stat_profile.audition_difficulty_id or '') if self.loadout is not None else ''
+            default_profile = self.repository.battle_profile(
+                self.scenario,
+                self.scenario.default_stage,
+                audition_difficulty_id=audition_difficulty_id or None,
+            )
+            baseline = float(default_profile.get('parameter_baseline') or 0.0)
+        if baseline <= 0.0:
+            raise ValueError(
+                'Battle parameter baseline is missing from master database: '
+                f'produce_id={self.scenario.produce_id}, stage_type={self.stage_type}'
+            )
+        dearness_ratio = 1.0 + min(max(int(self.loadout.dearness_level), 0), 20) * 0.01
+        return max((weighted_parameter / baseline) * dearness_ratio, 0.25)
+
+    def _init_rival_scores(self) -> None:
+        """从 ProduceExamBattleNpcGroup 初始化 Rival 分数列表。
+
+        每个 NPC 的初始分数从 scoreMin~scoreMax 范围随机取值。
+        """
+        npc_group_id = str(self.profile.get('npc_group_id') or '')
+        if not npc_group_id:
+            self.rank_state.rival_scores = []
+            return
+        npc_rows = self.repository.npc_group_map.get(npc_group_id, [])
+        self.rank_state.rival_scores = []
+        for npc_row in npc_rows:
+            score_min = float(npc_row.get('scoreMin') or 0)
+            score_max = float(npc_row.get('scoreMax') or 0)
+            if score_max > score_min:
+                initial_score = float(self.np_random.uniform(score_min, score_max))
+            else:
+                initial_score = score_min
+            self.rank_state.rival_scores.append(initial_score)
+
+    def _simulate_rival_turn_scores(self) -> None:
+        """每回合为每个 Rival 按阶段分配得分。
+
+        从 ProduceExamBattleNpcGroup 读取：
+        - scoreMin/scoreMax：NPC 分数范围（基础分）
+        - opScorePermil/midScorePermil/edScorePermil：前/中/后期得分分布比例
+
+        每回合 Rival 得分 = baseScore * phasePermil / 1000，
+        baseScore 从 scoreMin~scoreMax 随机取值。
+        """
+        npc_group_id = str(self.profile.get('npc_group_id') or '')
+        if not npc_group_id or not self.rank_state.rival_scores:
+            return
+        npc_rows = self.repository.npc_group_map.get(npc_group_id, [])
+        if not npc_rows:
+            return
+        total_turns = self.max_turns
+        if total_turns <= 0:
+            return
+        # 判断当前回合属于前/中/后期
+        phase_ratio = (self.turn - 1) / total_turns
+        for i, npc_row in enumerate(npc_rows):
+            if i >= len(self.rank_state.rival_scores):
+                break
+            score_min = float(npc_row.get('scoreMin') or 0)
+            score_max = float(npc_row.get('scoreMax') or 0)
+            # 选择阶段得分比例
+            if phase_ratio < 1.0 / 3.0:
+                phase_permil = float(npc_row.get('opScorePermil') or 333)
+            elif phase_ratio < 2.0 / 3.0:
+                phase_permil = float(npc_row.get('midScorePermil') or 333)
+            else:
+                phase_permil = float(npc_row.get('edScorePermil') or 334)
+            # 从 scoreMin~scoreMax 随机取基础分
+            if score_max > score_min:
+                base_score = float(self.np_random.uniform(score_min, score_max))
+            else:
+                base_score = score_min
+            turn_score = base_score * phase_permil / 1000.0
+            self.rank_state.rival_scores[i] += turn_score
+
+    def _update_self_rank(self) -> None:
+        """根据玩家分数和 Rival 分数计算当前排名。"""
+        if not self.rank_state.rival_scores:
+            self.rank_state.self_rank = 1
+            return
+        # 排名 = 比自己分数高的 Rival 数量 + 1
+        rank = 1
+        for rival_score in self.rank_state.rival_scores:
+            if rival_score > self.score:
+                rank += 1
+        self.rank_state.self_rank = rank
         """根据偶像属性与亲爱度估算默认分数倍率。"""
 
         if self.loadout is None:
@@ -1699,7 +1959,13 @@ class ExamRuntime:
         return encoded
 
     def _effective_score_bonus_multiplier(self) -> float:
-        """根据当前回合颜色把局内基准倍率换算成实际得分倍率。"""
+        """根据当前回合颜色把局内基准倍率换算成实际得分倍率。
+
+        合并三个因素的影响：
+        1. 基准倍率（由参数/baseline/亲爱度决定）
+        2. 回合颜色偏移（当回合颜色对应参数高于期望值时倍率上升）
+        3. 审查基准加成（由 ProduceExamBattleScoreConfig 分段函数决定）
+        """
 
         if not self._turn_color_enabled():
             return self.base_score_bonus_multiplier
@@ -1713,7 +1979,11 @@ class ExamRuntime:
         if expected_stat <= 1e-6:
             return self.base_score_bonus_multiplier
         selected_stat = float(stats[color_index])
-        return max(self.base_score_bonus_multiplier * (selected_stat / expected_stat), 0.0)
+        # 回合颜色偏移
+        color_ratio = selected_stat / expected_stat
+        # 审查基准加成
+        trend_multiplier = self._judging_trend_multiplier()
+        return max(self.base_score_bonus_multiplier * color_ratio * trend_multiplier, 0.0)
 
     def _refresh_turn_score_bonus_multiplier(self) -> None:
         """同步当前回合的实际得分倍率。"""
@@ -1726,6 +1996,7 @@ class ExamRuntime:
         bonus = 0
         for timed in self.active_effects:
             if str(timed.effect.get('effectType') or '') == 'ProduceExamEffectType_ExamPlayableValueAdd':
+                # 计数型：PlayableValueAdd 是每回合可出牌次数加成，整数语义
                 bonus += int(round(self._count_value(timed.effect)))
         return 1 + max(bonus, 0)
 
@@ -1838,6 +2109,7 @@ class ExamRuntime:
             return 0
         bonus = 0
         for timed in self._matched_play_count_buff_effects(card):
+            # 计数型：额外发动次数，整数语义
             bonus += int(round(self._raw_effect_value(timed.effect)))
         return max(bonus, 0)
 
@@ -2013,6 +2285,7 @@ class ExamRuntime:
     def _consume_parameter_buff_multiple(self, amount: float) -> None:
         """消耗绝好调层数，并从持续效果列表中移除对应实例。"""
 
+        # 计数型：play_limit 是手牌出牌上限，整数语义
         remaining = int(round(amount))
         if remaining <= 0:
             return
@@ -2140,6 +2413,11 @@ class ExamRuntime:
                 'label': self.turn_color_label(),
             })
         self._refresh_turn_score_bonus_multiplier()
+
+        # 考试模式下每回合模拟 Rival 得分并更新排名
+        if self.battle_kind != 'lesson' and not self._uses_clear_training_rules():
+            self._simulate_rival_turn_scores()
+            self._update_self_rank()
 
         # 好印象和好调都会在新回合开始时自然衰减。
         if self.resources['review'] > 0:
@@ -2405,6 +2683,7 @@ class ExamRuntime:
             phase_type='ProduceExamPhaseType_ExamStaminaReduceCard',
             status_change_origin='card',
         )
+        # 计数型：stamina_spent 是整数计数量，非收益型，用 int(round()) 是正确的
         self.total_counters['stamina_spent'] += int(round(spent))
         self.turn_counters['stamina_spent'] += int(round(spent))
         self._dispatch_phase('ProduceExamPhaseType_ExamStaminaReduceCard', effect_types=['ProduceExamEffectType_ExamStaminaReduce'])
@@ -2435,6 +2714,7 @@ class ExamRuntime:
             resolved_effect_specs.append(play_effect)
 
         card_repeat_total = 1 + self._card_repeat_bonus(card)
+        # 计数型：lesson_repeat_bonus 是出牌次数加成，整数语义
         lesson_repeat_bonus = int(round(self._current_card_grow_total('ProduceCardGrowEffectType_LessonCountAdd')))
         lesson_repeat_bonus -= int(round(self._current_card_grow_total('ProduceCardGrowEffectType_LessonCountReduce')))
         for _ in range(max(card_repeat_total, 1)):
@@ -2500,7 +2780,8 @@ class ExamRuntime:
 
         if skipped:
             self._dispatch_phase('ProduceExamPhaseType_ExamTurnSkip', phase_value=self.turn)
-        review_activation_count = max(1 + int(round(self._timed_effect_stack_value('ProduceExamEffectType_ExamReviewCountAdd'))), 1)
+        # 好印象发动次数：比例引用型收益，按手册切り上げ规则向上取整
+        review_activation_count = max(1 + self._ceil_positive(self._timed_effect_stack_value('ProduceExamEffectType_ExamReviewCountAdd')), 1)
         _review_delta = self._score_gain(self._apply_score_value_modifiers(self.resources['review'])) * review_activation_count
         self.score += _review_delta
         if self.current_turn_color in self.score_per_color:
@@ -2596,6 +2877,7 @@ class ExamRuntime:
         blocked = min(self.resources['block'], amount)
         if blocked > 0:
             self.resources['block'] -= blocked
+            # 计数型：block_consumed 是整数计数量，非收益型
             self.total_counters['block_consumed'] += int(round(blocked))
         direct_damage = max(amount - blocked, 0.0) + force_amount
         if direct_damage > 0:
@@ -2631,12 +2913,17 @@ class ExamRuntime:
         return {key: max(value, 0.0) for key, value in costs.items()}
 
     def _decay_turn_effects(self) -> None:
-        """在回合推进时衰减持续效果和附魔回合数。"""
+        """在回合推进时衰减持续效果和附魔回合数。
+
+        手册规则：ターン経過減免 — 新規効果が付与されたターンは減免されない。
+        即本回合新挂的效果（applied_turn == self.turn）不减少 remaining_turns。
+        """
 
         next_effects: list[TimedExamEffect] = []
         for timed in self.active_effects:
             remaining_turns = timed.remaining_turns
-            if remaining_turns is not None:
+            # ターン経過減免：本回合新挂的效果不衰减
+            if remaining_turns is not None and timed.applied_turn < self.turn:
                 remaining_turns -= 1
             if remaining_turns is not None and remaining_turns <= 0:
                 continue
@@ -2647,7 +2934,8 @@ class ExamRuntime:
         next_enchants: list[TriggeredEnchant] = []
         for enchant in self.active_enchants:
             remaining_turns = enchant.remaining_turns
-            if remaining_turns is not None:
+            # ターン経過減免：本回合新挂的附魔不衰减
+            if remaining_turns is not None and enchant.applied_turn < self.turn:
                 remaining_turns -= 1
             if remaining_turns is not None and remaining_turns <= 0:
                 continue
@@ -2664,7 +2952,12 @@ class ExamRuntime:
         effect_types: list[str] | None = None,
         status_change_origin: str | None = None,
     ) -> None:
-        """在单个考试 phase 下运行所有激活中的触发源。"""
+        """在单个考试 phase 下运行所有激活中的触发源。
+
+        Gimmick 条件判定和效果按优先级在 _start_turn() 中优先执行，
+        此方法额外检查是否有遗漏的 Gimmick（通过 _resolved_gimmick_keys 去重防止重复），
+        然后处理 P-item / Enchant 触发和 Card / Drink 效果。
+        """
 
         if self.turn > 0:
             self._apply_gimmicks_for_turn(self.turn)
@@ -3189,6 +3482,7 @@ class ExamRuntime:
                 remaining_count=remaining_count,
                 source=source,
                 source_identity=source_identity,
+                applied_turn=self.turn,
             )
         )
 
@@ -3210,6 +3504,7 @@ class ExamRuntime:
                 remaining_turns=remaining_turns,
                 remaining_count=remaining_count,
                 source=source,
+                applied_turn=self.turn,
             )
         )
         self._sync_effect_resources()
@@ -3240,6 +3535,7 @@ class ExamRuntime:
                 remaining_count=remaining_count,
                 source=source,
                 source_identity=source,
+                applied_turn=self.turn,
             )
         )
 
@@ -3395,11 +3691,20 @@ class ExamRuntime:
         self.scheduled_effects = remaining
 
     def _apply_gimmicks_for_turn(self, turn: int) -> None:
-        """在指定回合应用满足条件的考场机制效果。"""
+        """在指定回合按优先级应用满足条件的考场机制效果。
 
-        for row in self.gimmick_rows:
-            if int(row.get('startTurn') or 0) != turn:
-                continue
+        Gimmick 按 priority 字段升序排列（低数值=高优先级），确保高优先级的 Gimmick
+        先于低优先级执行，符合手册中 Gimmick 優先度的规则。
+        """
+
+        matching_rows = [
+            row for row in self.gimmick_rows
+            if int(row.get('startTurn') or 0) == turn
+        ]
+        # 按优先级升序排列（低数值=高优先级）
+        matching_rows.sort(key=lambda r: int(r.get('priority') or 0))
+
+        for row in matching_rows:
             gimmick_key = (
                 str(row.get('id') or ''),
                 int(row.get('priority') or 0),
@@ -3732,6 +4037,7 @@ class ExamRuntime:
             return
         if self.stance_level >= 3:
             self._gain_block(float(self.exam_setting.get('overPreservationReleaseBlockAdd') or 0), effect_type='ProduceExamEffectType_ExamBlockFix')
+            # 计数型：play_limit 是出牌上限，整数语义
             self.play_limit += int(round(float(self.exam_setting.get('overPreservationReleasePlayableValueAdd') or 0)))
             if target_stance == 'full_power':
                 self._add_lesson_grow_effect_to_all_cards(float(self.exam_setting.get('overPreservationReleaseToFullPowerGrowEffectLessonAdd') or 0))
@@ -3745,6 +4051,7 @@ class ExamRuntime:
         block_add = float(self.exam_setting.get(block_key) or 0)
         if block_add > 0:
             self._gain_block(block_add, effect_type='ProduceExamEffectType_ExamBlockFix')
+        # 计数型：play_limit 是出牌上限，整数语义
         self.play_limit += int(round(float(self.exam_setting.get(playable_key) or 0)))
 
     def _move_hold_cards_to_hand(self) -> None:
@@ -3758,6 +4065,7 @@ class ExamRuntime:
     def _add_lesson_grow_effect_to_all_cards(self, value: float) -> None:
         """给所有运行时技能卡追加固定打分成长效果。"""
 
+        # 计数型：成长效果值为整数，用于构造 grow_effect_id
         amount = int(round(value))
         if amount <= 0:
             return
@@ -3826,6 +4134,7 @@ class ExamRuntime:
         if not self._set_stance('full_power', 1):
             return
         self.stance_locked = True
+        # 计数型：play_limit 是出牌上限，整数语义
         self.play_limit += int(round(float(self.exam_setting.get('fullPowerPlayableValueAdd') or 0)))
         self._move_hold_cards_to_hand()
 

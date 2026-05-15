@@ -288,6 +288,8 @@ class ProduceActionCandidate:
     route_feasibility: float = 0.0
     route_vote_margin: float = 0.0
     route_param_margin: float = 0.0
+    is_business_excellent: bool = False
+    """是否为营业大成功变体（isBusinessExcellent=true 的 EventDetail 行）。"""
 
 
 @dataclass(frozen=True)
@@ -321,6 +323,30 @@ class BusinessCardReward:
 
     card_id: str
     upgrade_count: int = 0
+
+
+class BusinessFacilityType:
+    """营业设施类型，对应主数据 produceStoryGroupId 中的编号和 EventDetail ID 中的子串。
+
+    映射关系（通过 produceStoryGroupId 验证）：
+    - COMPANY (business-1) = produce_drink：企業活動，Pドリンク+スキルカード
+    - MUNICIPALITY (business-2) = produce_point：自治体活動，Pポイント+スキルカード
+    - RESORT (business-3) = stamina：リゾート施設，体力回復+スキルカード
+    - COMMERCIAL (business-4) = produce_card：商業施設，強化済みスキルカード
+    """
+
+    COMPANY = 'produce_drink'
+    MUNICIPALITY = 'produce_point'
+    RESORT = 'stamina'
+    COMMERCIAL = 'produce_card'
+
+    # 子串匹配键到设施类型的映射
+    _REWARD_KIND_MAP: dict[str, str] = {
+        'produce_drink': COMPANY,
+        'produce_point': MUNICIPALITY,
+        'stamina': RESORT,
+        'produce_card': COMMERCIAL,
+    }
 
 
 @dataclass
@@ -877,6 +903,17 @@ class ProduceRuntime:
                 self.produce_item_interpreter.mark_fired(active_item)
                 fired_item_ids.add(active_item.item_id)
                 for effect in active_item.spec.effects:
+                    # Skill 级触发器检查：如果效果有 skill_trigger，需要额外验证 phase 匹配
+                    if effect.skill_trigger is not None:
+                        if not self.produce_item_interpreter.trigger_matches(
+                            effect.skill_trigger,
+                            phase_type=phase_type,
+                            scenario=self.scenario,
+                            state=self.state,
+                            deck=self.deck,
+                            context=context,
+                        ):
+                            continue
                     self._apply_resolved_produce_item_effect(active_item, effect, source_action_type='idol_item')
         if self.active_produce_skills:
             snapshot_skills = list(self.active_produce_skills)
@@ -914,16 +951,15 @@ class ProduceRuntime:
         return tuple(phases)
 
     def _business_reward_kind(self, source_row_id: str) -> str:
-        """从营业事件 row id 中提取产出类型标签。"""
+        """从营业事件 row id 中提取产出类型标签。
 
-        if 'produce_card' in source_row_id:
-            return 'produce_card'
-        if 'produce_drink' in source_row_id:
-            return 'produce_drink'
-        if 'produce_point' in source_row_id:
-            return 'produce_point'
-        if 'stamina' in source_row_id or 'rest' in source_row_id:
-            return 'stamina'
+        对应主数据 EventDetail ID 命名中的子串（produce_card/produce_drink/produce_point/stamina），
+        映射关系见 BusinessFacilityType 类文档。
+        """
+
+        for key in BusinessFacilityType._REWARD_KIND_MAP:
+            if key in source_row_id:
+                return key
         return ''
 
     # ── 培育阶段 RL 势函数（PBRS） ─────────────────────────────────
@@ -1512,20 +1548,23 @@ class ProduceRuntime:
         return min(values)
 
     def _business_action_profile(self, source_row_id: str) -> tuple[float, float, str]:
-        """把营业类型映射成基础体力/P点影响和附带资源标签。"""
+        """把营业类型映射成基础体力/P点影响和附带资源标签。
+
+        4 类设施按手册描述（已通过 produceStoryGroupId 验证映射）：
+        - 企業活動 (BusinessFacilityType.COMPANY / produce_drink)：体力消耗，PP 少，给 P饮料
+        - 自治体活動 (BusinessFacilityType.MUNICIPALITY / produce_point)：体力消耗低，额外 PP
+        - リゾート施設 (BusinessFacilityType.RESORT / stamina)：回体为主
+        - 商業施設 (BusinessFacilityType.COMMERCIAL / produce_card)：给强化卡
+        """
 
         reward_kind = self._business_reward_kind(source_row_id)
-        # 4 类双重收益（P点/体力为主收益；卡为副收益由 _business_action_bonus_card 给）
-        # 企业活动 (card + drink)：体力消耗，PP 少
-        if reward_kind == 'produce_drink':
+        if reward_kind == BusinessFacilityType.COMPANY:
             return -3.0, 2.0, 'drink'
-        # 自治体活动 (card + PP)：体力消耗低，额外 PP
-        if reward_kind == 'produce_point':
+        if reward_kind == BusinessFacilityType.MUNICIPALITY:
             return -2.0, 8.0, 'point'
-        # 度假设施 (card + 体力回复)：回体为主
-        if reward_kind == 'stamina':
+        if reward_kind == BusinessFacilityType.RESORT:
             return 8.0, 2.0, 'stamina'
-        # 商业设施 (强化卡)：给强化卡
+        # 商業施設：给强化卡
         return -2.0, 4.0, 'card'
 
     def _business_big_success(self, source_row_id: str) -> bool:
@@ -1546,6 +1585,41 @@ class ProduceRuntime:
         big_prob = float(np.clip(0.10 + 0.30 * stat_ratio, 0.05, 0.70))
         return bool(self.np_random.random() < big_prob)
 
+    def _lookup_business_excellent_effects(self, source_row_id: str) -> list[str]:
+        """查找营业大成功变体行的 produceEffectIds。
+
+        主数据中每个普通营业行都有对应的 isBusinessExcellent=true 的行，
+        其 ID 通常为普通行 ID 加 '-ex' 后缀，且 produceEffectIds 已包含放大后的效果值。
+        """
+
+        # 尝试 '-ex' 后缀匹配，使用 event_details.by_id 快速查找
+        excellent_id = source_row_id + '-ex'
+        excellent_rows = self.event_details.by_id.get(excellent_id)
+        if excellent_rows:
+            for row in excellent_rows:
+                if bool(row.get('isBusinessExcellent')):
+                    return list(row.get('produceEffectIds') or [])
+        # 后缀匹配失败时，按同一 produceStoryGroupId 查找 isBusinessExcellent=true 的行
+        base_rows = self.event_details.by_id.get(source_row_id)
+        if not base_rows:
+            return []
+        base_row = base_rows[0]
+        story_group_id = str(base_row.get('produceStoryGroupId') or '')
+        if not story_group_id:
+            return []
+        # 同组的大成功行：produceStoryGroupId 末位+1（如 -1 变 -2）
+        parts = story_group_id.rsplit('-', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            excellent_group_id = f'{parts[0]}-{int(parts[1]) + 1}'
+        else:
+            return []
+        # 线性扫描同组行（每组通常只有 2 行）
+        for row in self.event_details.rows:
+            if (str(row.get('produceStoryGroupId') or '') == excellent_group_id
+                    and bool(row.get('isBusinessExcellent'))):
+                return list(row.get('produceEffectIds') or [])
+        return []
+
     def _business_action_bonus_card_reward(self, source_row_id: str) -> BusinessCardReward:
         """按帮助页为营业抽取附带技能卡奖励，并保留强化段阶。"""
 
@@ -1558,7 +1632,7 @@ class ProduceRuntime:
             return BusinessCardReward(card_id='')
         card_row = dict(sampled)
         # 商業施設：官方说明为获得强化済み技能卡；リゾート施設只是普通技能卡加体力回复。
-        if reward_kind in {'produce_card', 'card'}:
+        if reward_kind in {BusinessFacilityType.COMMERCIAL, 'card'}:
             upgraded = self._lookup_card_upgrade_row(str(card_row.get('id') or ''), min(int(card_row.get('upgradeCount') or 0) + 1, 1))
             if upgraded is not None:
                 card_row = dict(upgraded)
@@ -2269,6 +2343,8 @@ class ProduceRuntime:
         """把待接受考试结果中的路线进度和资源收益写回状态。"""
 
         if not bool(result.get('cleared')):
+            # 中间考试不合格时标记失败状态
+            self.state['failed'] = True
             return
         self.state['fan_votes'] += float(result.get('fan_vote_gain') or 0.0)
         self.state['deck_quality'] += float(result.get('deck_quality_gain') or 0.0)
@@ -3113,11 +3189,14 @@ class ProduceRuntime:
                 business_vote_gain = max(float(self.state.get('fan_votes') or 0.0) - fan_votes_before_action, 0.0)
                 self._dispatch_produce_item_phase('ProducePhaseType_EndStepEventBusiness', **phase_context)
                 # 企業活動（drink 类）：额外给 P 饮料（帮助页：スキルカード + Pドリンク）
-                if self._business_reward_kind(candidate.source_row_id) == 'produce_drink':
+                if self._business_reward_kind(candidate.source_row_id) == BusinessFacilityType.COMPANY:
                     self._grant_random_drink()
-                # 大成功：按当前参数高低决定是否触发，只放大本次营业本身获得的 fan_votes。
+                # 大成功：按当前参数高低判定，成功时查找 isBusinessExcellent=true 的 EventDetail 行
+                # 主数据中已预计算大成功版效果值，无需手动倍率放大
                 if self._business_big_success(candidate.source_row_id):
-                    self.state['fan_votes'] += business_vote_gain * 0.50
+                    excellent_effect_ids = self._lookup_business_excellent_effects(candidate.source_row_id)
+                    if excellent_effect_ids:
+                        self._apply_effect_rows(excellent_effect_ids, source_action_type=ACTION_BUSINESS)
             elif candidate.action_type == ACTION_PRESENT:
                 if candidate.resource_type == 'ProduceResourceType_ProduceDrink':
                     self._grant_random_drink()
@@ -3498,16 +3577,27 @@ class ProduceRuntime:
             success_probability = float(np.clip(success_probability, 0.05, 1.0))
             stat_deltas = (0.0, 0.0, 0.0)
             if action_type == ACTION_SCHOOL_CLASS:
-                stamina_delta = min(stamina_delta, -8.0)
-                stat_deltas = (
-                    36.0 * (1.0 + float(self.state.get('vocal_growth') or 0.0)),
-                    24.0 * (1.0 + float(self.state.get('dance_growth') or 0.0)),
-                    24.0 * (1.0 + float(self.state.get('visual_growth') or 0.0)),
-                )
+                # 手册：授業主に体力を消費して、パラメータの上昇とスキルカードの獲得
+                # stamina 从 EventSuggestion 读取，但如果为 0 则使用最低消耗
+                if stamina_delta >= 0:
+                    stamina_delta = min(stamina_delta, -8.0)
+                # 参数上升：优先从 produceEffectIds 提取，否则使用 growth 倍率估算
+                extracted_deltas = self._extract_parameter_deltas(produce_effect_ids + success_effect_ids)
+                if extracted_deltas:
+                    stat_deltas = extracted_deltas
+                else:
+                    stat_deltas = (
+                        36.0 * (1.0 + float(self.state.get('vocal_growth') or 0.0)),
+                        24.0 * (1.0 + float(self.state.get('dance_growth') or 0.0)),
+                        24.0 * (1.0 + float(self.state.get('visual_growth') or 0.0)),
+                    )
             elif action_type == ACTION_OUTING:
-                stamina_delta = max(stamina_delta, self.state['max_stamina'] * 0.35)
-                produce_point_delta = -max(abs(produce_point_delta), 12.0)
-                # 帮助页：外出可能获得 P饮料 / 技能卡强化删除变化（通过 produce_effect_ids 走）
+                # 手册：外出主にPポイントを消費して体力を回復、Pドリンク獲得、スキルカードの強化/削除/変化
+                # stamina 回复从 EventSuggestion 读取，但如果不足则使用最低值
+                if stamina_delta <= 0:
+                    stamina_delta = max(stamina_delta, self.state['max_stamina'] * 0.35)
+                if produce_point_delta >= 0:
+                    produce_point_delta = -max(abs(produce_point_delta), 12.0)
             elif action_type == ACTION_ACTIVITY_SUPPLY:
                 stamina_delta = 0.0
                 # 帮助页：活動支給 同时获得技能卡、P点和P饮料，不是三选一。
@@ -3664,10 +3754,12 @@ class ProduceRuntime:
             produce_card_level = card_reward.upgrade_count
             resource_type = 'ProduceResourceType_ProduceDrink'
         elif action_type == ACTION_SCHOOL_CLASS:
+            # 手册兜底值：授業消耗体力，参数上升+技能卡
             success_probability = 0.95
             stamina_delta = -8.0
             produce_point_delta = 0.0
         elif action_type == ACTION_OUTING:
+            # 手册兜底值：外出消耗P点，回复体力+P饮料+技能卡变化
             success_probability = 0.97
             stamina_delta = self.state['max_stamina'] * 0.35
             produce_point_delta = -12.0
@@ -3681,7 +3773,11 @@ class ProduceRuntime:
             resource_type = 'ProduceResourceType_ProduceDrink'
         stat_deltas = (0.0, 0.0, 0.0)
         if action_type == ACTION_SCHOOL_CLASS:
-            stat_deltas = tuple(self._apply_growth_rates((36.0, 24.0, 24.0)))
+            stat_deltas = (
+                36.0 * (1.0 + float(self.state.get('vocal_growth') or 0.0)),
+                24.0 * (1.0 + float(self.state.get('dance_growth') or 0.0)),
+                24.0 * (1.0 + float(self.state.get('visual_growth') or 0.0)),
+            )
         return ProduceActionCandidate(
             label=self._action_label(action_type),
             action_type=action_type,
@@ -3695,6 +3791,26 @@ class ProduceRuntime:
             success_probability=success_probability,
             stat_deltas=stat_deltas,
         )
+
+    def _extract_parameter_deltas(self, effect_ids: list[str]) -> tuple[float, float, float] | None:
+        """从 ProduceEffect 列表中提取参数增量。
+
+        遍历效果ID，查找 VocalAddition/DanceAddition/VisualAddition 类型的效果，
+        返回对应的参数增量元组。如果没有任何参数增量效果，返回 None。
+        """
+        deltas = [0.0, 0.0, 0.0]
+        found = False
+        for effect_id in effect_ids:
+            row = self.repository.produce_effects.first(effect_id)
+            if not row:
+                continue
+            effect_type = str(row.get('effectType') or '')
+            if effect_type in PARAMETER_EFFECT_INDEX:
+                index = PARAMETER_EFFECT_INDEX[effect_type]
+                value = float(row.get('effectValue1') or 0)
+                deltas[index] += value
+                found = True
+        return tuple(deltas) if found else None
 
     def _effect_ids_for_types(self, effect_types: list[str]) -> list[str]:
         """按效果类型随机抽取对应的 ProduceEffect 行。"""
@@ -4645,6 +4761,7 @@ class ProduceRuntime:
             'effective_score': effective_score,
             'target_score': target_score,
             'cleared': cleared,
+            'passed': bool(runtime.rank_state.passed) if hasattr(runtime, 'rank_state') else cleared,
             'rank': rank,
             'rank_threshold': rank_threshold,
             'rival_scores': [float(score) for score in rival_scores],

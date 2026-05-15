@@ -1121,7 +1121,10 @@ class GakumasExamEnv(gym.Env):
         battle_kind = self.battle_kind
         lesson_kwargs: dict[str, Any] = {}
         if battle_kind == 'lesson' and lesson_spec is not None:
-            exam_setting = self.repository.load_table('ExamSetting').first('p_exam_setting-1') or {}
+            # 从 Produce 表的 examSettingId 字段读取 ExamSetting 行 ID
+            produce_row = self.repository.produces.first(self.scenario.produce_id) or {}
+            exam_setting_id = str(produce_row.get('examSettingId') or 'p_exam_setting-1')
+            exam_setting = self.repository.load_table('ExamSetting').first(exam_setting_id) or {}
             lesson_kwargs = {
                 'lesson_type': lesson_spec.lesson_type,
                 'lesson_types': lesson_spec.lesson_trigger_types,
